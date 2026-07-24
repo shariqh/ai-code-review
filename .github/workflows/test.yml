@@ -20,5 +20,11 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Load composite action
+        uses: ./
+        with:
+          copilot-token: ""
+          github-token: not-used-on-push
+
       - name: Run tests
         run: bash tests/test.sh

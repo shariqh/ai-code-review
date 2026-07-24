@@ -67,6 +67,8 @@ assert_contains "$TEMP_DIR/large-work/batches/batch_000.diff" "truncated at 100 
 source "$ROOT/scripts/lib.sh"
 printf 'No issues found.\n' > "$TEMP_DIR/clean.md"
 is_clean_review "$TEMP_DIR/clean.md" || fail "clean result was not recognized"
+printf 'No issues found.No issues found.\n' > "$TEMP_DIR/repeated-clean.md"
+is_clean_review "$TEMP_DIR/repeated-clean.md" || fail "repeated clean result was not recognized"
 printf 'Severity: HIGH\n' > "$TEMP_DIR/finding.md"
 if is_clean_review "$TEMP_DIR/finding.md"; then
   fail "finding was classified as clean"

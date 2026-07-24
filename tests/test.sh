@@ -113,4 +113,10 @@ GITHUB_OUTPUT="$guard_output" \
 assert_contains "$guard_output" "skip=true"
 assert_contains "$guard_output" "reason=fork"
 
+install_line=$(grep -n 'npm install --global --ignore-scripts' "$ROOT/action.yml" | cut -d: -f1)
+checkout_line=$(grep -n 'name: Check out pull request' "$ROOT/action.yml" | cut -d: -f1)
+[ "$install_line" -lt "$checkout_line" ] || fail "Copilot CLI must be installed before PR checkout"
+assert_contains "$ROOT/action.yml" "NPM_CONFIG_USERCONFIG: /dev/null"
+assert_contains "$ROOT/action.yml" "working-directory: \${{ runner.temp }}"
+
 echo "All tests passed."

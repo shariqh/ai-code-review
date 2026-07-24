@@ -87,6 +87,9 @@ be present.
 
 - Fork PRs and drafts are skipped.
 - The caller should keep the job-level guard and concurrency from the example.
+- The pinned Copilot CLI is installed before PR checkout, from the public npm
+  registry, in the runner temp directory, with project npm configuration and
+  lifecycle scripts disabled.
 - Checkout does not persist `GITHUB_TOKEN` credentials.
 - Copilot receives the diff inline and loads no repository instructions.
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and

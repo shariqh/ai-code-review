@@ -1,0 +1,142 @@
+name: AI code review
+description: Adversarial pull request review with GitHub Copilot CLI and a sticky PR comment
+
+inputs:
+  copilot-token:
+    description: Fine-grained PAT with the Copilot Requests permission
+    required: true
+  github-token:
+    description: Caller repository GITHUB_TOKEN used to manage the sticky comment
+    required: true
+  model:
+    description: Copilot CLI model identifier
+    required: false
+    default: gpt-5.6-sol
+  copilot-cli-version:
+    description: Exact @github/copilot package version
+    required: false
+    default: 1.0.74
+  node-version:
+    description: Node.js version passed to actions/setup-node
+    required: false
+    default: lts/*
+  reasoning-effort:
+    description: Reasoning effort passed to Copilot CLI
+    required: false
+    default: high
+  context:
+    description: Context tier passed to Copilot CLI
+    required: false
+    default: long_context
+  batch-max-bytes:
+    description: Target maximum bytes per review batch
+    required: false
+    default: "50000"
+  file-max-bytes:
+    description: Maximum bytes reviewed from one changed file
+    required: false
+    default: "120000"
+  max-batches:
+    description: Maximum model calls per pull request
+    required: false
+    default: "8"
+  owner-only:
+    description: Restrict reviews to PRs authored by the repository owner
+    required: false
+    default: "true"
+  comment-marker:
+    description: Identifier used for the sticky PR comment
+    required: false
+    default: ai-code-review-sticky
+
+runs:
+  using: composite
+  steps:
+    - name: Check review eligibility
+      id: guard
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REPOSITORY: ${{ github.repository }}
+        REPOSITORY_OWNER: ${{ github.repository_owner }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_DRAFT: ${{ github.event.pull_request.draft }}
+        OWNER_ONLY: ${{ inputs.owner-only }}
+        COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
+        REVIEW_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: "$GITHUB_ACTION_PATH/scripts/guard.sh"
+
+    - name: Check out pull request
+      if: steps.guard.outputs.skip == 'false'
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Set up Node
+      if: steps.guard.outputs.skip == 'false'
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Check runner prerequisites
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      run: "$GITHUB_ACTION_PATH/scripts/preflight.sh"
+
+    - name: Install Copilot CLI
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        COPILOT_CLI_VERSION: ${{ inputs.copilot-cli-version }}
+      run: npm install --global "@github/copilot@$COPILOT_CLI_VERSION"
+
+    - name: Build review batches
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        BATCH_MAX_BYTES: ${{ inputs.batch-max-bytes }}
+        FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
+        MAX_BATCHES: ${{ inputs.max-batches }}
+      run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
+
+    - name: Run adversarial review
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        REVIEW_MODEL: ${{ inputs.model }}
+        REASONING_EFFORT: ${{ inputs.reasoning-effort }}
+        CONTEXT_TIER: ${{ inputs.context }}
+      run: "$GITHUB_ACTION_PATH/scripts/run-review.sh"
+
+    - name: Post sticky review comment
+      if: steps.guard.outputs.skip == 'false'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        RUN_ID: ${{ github.run_id }}
+        REVIEW_MODEL: ${{ inputs.model }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
+      run: "$GITHUB_ACTION_PATH/scripts/post-comment.sh"
+
+    - name: Clean review workspace
+      if: always() && steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+      run: "$GITHUB_ACTION_PATH/scripts/cleanup.sh"

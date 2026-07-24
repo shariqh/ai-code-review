@@ -59,6 +59,8 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         REPOSITORY: ${{ github.repository }}
         REPOSITORY_OWNER: ${{ github.repository_owner }}
+        WORKFLOW_ACTOR: ${{ github.actor }}
+        WORKFLOW_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -100,6 +102,7 @@ runs:
         fetch-depth: 0
         persist-credentials: false
         ref: ${{ github.event.pull_request.head.sha }}
+        path: .ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Build review batches
       if: steps.guard.outputs.skip == 'false'
@@ -107,6 +110,7 @@ runs:
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REVIEW_REPO_DIR: ${{ github.workspace }}/.ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
         BATCH_MAX_BYTES: ${{ inputs.batch-max-bytes }}
         FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
@@ -143,5 +147,6 @@ runs:
       if: always() && steps.guard.outputs.skip == 'false'
       shell: bash
       env:
+        REVIEW_REPO_DIR: ${{ github.workspace }}/.ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
       run: "$GITHUB_ACTION_PATH/scripts/cleanup.sh"

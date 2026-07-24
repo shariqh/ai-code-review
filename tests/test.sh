@@ -79,9 +79,11 @@ node "$ROOT/scripts/truncate-comment.mjs" \
 assert_contains "$TEMP_DIR/truncated.md" "Review output truncated"
 
 guard_output="$TEMP_DIR/guard.out"
-EVENT_NAME=pull_request \
+EVENT_NAME=pull_request_target \
 REPOSITORY=shariqh/example \
 REPOSITORY_OWNER=shariqh \
+WORKFLOW_ACTOR=shariqh \
+WORKFLOW_TRIGGERING_ACTOR=shariqh \
 PR_AUTHOR=shariqh \
 PR_BASE_SHA=base \
 PR_HEAD_SHA=head \
@@ -99,6 +101,8 @@ assert_contains "$guard_output" "skip=false"
 EVENT_NAME=pull_request \
 REPOSITORY=shariqh/example \
 REPOSITORY_OWNER=shariqh \
+WORKFLOW_ACTOR=contributor \
+WORKFLOW_TRIGGERING_ACTOR=contributor \
 PR_AUTHOR=contributor \
 PR_BASE_SHA=base \
 PR_HEAD_SHA=head \
@@ -118,5 +122,7 @@ checkout_line=$(grep -n 'name: Check out pull request' "$ROOT/action.yml" | cut 
 [ "$install_line" -lt "$checkout_line" ] || fail "Copilot CLI must be installed before PR checkout"
 assert_contains "$ROOT/action.yml" "NPM_CONFIG_USERCONFIG: /dev/null"
 assert_contains "$ROOT/action.yml" "working-directory: \${{ runner.temp }}"
+assert_contains "$ROOT/action.yml" "path: .ai-code-review-pr-"
+assert_contains "$ROOT/examples/ai-code-review.yml" "pull_request_target:"
 
 echo "All tests passed."

@@ -16,9 +16,10 @@ case "${OWNER_ONLY:-true}" in
     ;;
 esac
 
-if [ "${EVENT_NAME:-}" != "pull_request" ]; then
-  skip "AI code review only runs for pull_request events." "not-pull-request"
-fi
+case "${EVENT_NAME:-}" in
+  pull_request|pull_request_target) ;;
+  *) skip "AI code review only runs for pull request events." "not-pull-request" ;;
+esac
 
 if [ -z "${PR_NUMBER:-}" ] || [ -z "${PR_BASE_SHA:-}" ] || [ -z "${PR_HEAD_SHA:-}" ]; then
   echo "::error::pull request metadata is incomplete"
@@ -35,6 +36,15 @@ fi
 
 if [ "$OWNER_ONLY" = "true" ] && [ "${PR_AUTHOR:-}" != "${REPOSITORY_OWNER:-}" ]; then
   skip "AI code review is configured for repository-owner pull requests only." "not-owner"
+fi
+
+if [ "$OWNER_ONLY" = "true" ] && [ "${WORKFLOW_ACTOR:-}" != "${REPOSITORY_OWNER:-}" ]; then
+  skip "AI code review is configured for workflow activity by the repository owner only." "not-owner-actor"
+fi
+
+if [ "$OWNER_ONLY" = "true" ] \
+  && [ "${WORKFLOW_TRIGGERING_ACTOR:-}" != "${REPOSITORY_OWNER:-}" ]; then
+  skip "AI code review reruns must also be started by the repository owner." "not-owner-triggering-actor"
 fi
 
 if [ -z "${COPILOT_GITHUB_TOKEN:-}" ]; then

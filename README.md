@@ -13,6 +13,11 @@ as clean.
 Copy [`examples/ai-code-review.yml`](examples/ai-code-review.yml) into the
 consumer repository as `.github/workflows/ai-code-review.yml`.
 
+The example uses `pull_request_target`. GitHub loads that workflow and its
+action reference from the repository's default branch, so a pull request cannot
+replace the trusted workflow before secrets are made available. The action
+checks out the PR head only as data and never executes repository code.
+
 For the first pilot, the example follows `@main`. After the pilot is successful,
 pin the action to an immutable commit SHA. A moving `v1` tag will be created
 after the initial rollout is proven.
@@ -86,11 +91,17 @@ be present.
 ## Security model
 
 - Fork PRs and drafts are skipped.
-- The caller should keep the job-level guard and concurrency from the example.
+- The caller must use `pull_request_target` and keep the job-level guard and
+  concurrency from the example. A secret-bearing `pull_request` workflow is
+  mutable by the PR branch and is unsafe on a persistent self-hosted runner.
+- Personal-repository reviews require the PR author, workflow actor, and rerun
+  actor to match the repository owner.
 - The pinned Copilot CLI is installed before PR checkout, from the public npm
   registry, in the runner temp directory, with project npm configuration and
   lifecycle scripts disabled.
 - Checkout does not persist `GITHUB_TOKEN` credentials.
+- PR contents are checked out into an isolated subdirectory and removed after
+  the review, including on persistent self-hosted runners.
 - Copilot receives the diff inline and loads no repository instructions.
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and
   GitHub tools are unavailable.

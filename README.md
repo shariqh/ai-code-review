@@ -98,11 +98,13 @@ positives. To teach it, commit a `context-file` (default
 conventions and known false positives. When present, its content is injected
 into the prompt as trusted maintainer guidance, ahead of the untrusted diff.
 
-The file is read from the PR **base ref** via `git show`, never from the PR
-head or the checked-out working tree, so a pull request cannot rewrite the
-instructions that review it — edits to the context file take effect only
-after they land on the base branch. Content beyond 16 KB is truncated with a
-note.
+The file is read from the **current tip of the PR's base branch** via
+`git show` (falling back to the event's base SHA if the remote ref is
+unavailable), never from the PR head or the checked-out working tree, so a
+pull request cannot rewrite the instructions that review it — edits to the
+context file take effect only after they land on the base branch, and then
+apply to already-open PRs on their next review. Content beyond 16 KB is
+truncated with a note.
 
 ## Security model
 
@@ -119,7 +121,7 @@ note.
 - PR contents are checked out into an isolated subdirectory and removed after
   the review, including on persistent self-hosted runners.
 - Copilot receives the diff inline and loads no repository instructions,
-  except the maintainer `context-file`, which is read from the PR base ref
+  except the maintainer `context-file`, which is read from the base branch
   only — never from the PR head — so PRs cannot influence their own review
   prompt.
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and

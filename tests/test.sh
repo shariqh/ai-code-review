@@ -155,6 +155,29 @@ CONTEXT_MAX_BYTES=10 \
   "$ROOT/scripts/prepare-review.sh" > /dev/null
 assert_contains "$ctx_work/review-context.md" "review context truncated at 10 bytes"
 
+# When the base branch tip is available, it wins over the (possibly stale)
+# event BASE_SHA — a PR opened before a context edit landed still gets the
+# current context. Simulate a post-PR context edit on origin/main.
+printf 'original\n' > "$ctx_repo/code.txt"
+printf 'UPDATED context landed on main after the PR opened.\n' \
+  > "$ctx_repo/.github/ai-review-context.md"
+git -C "$ctx_repo" add -A
+git -C "$ctx_repo" -c user.email=test@test -c user.name=test commit -q -m newer-main
+git -C "$ctx_repo" update-ref refs/remotes/origin/main HEAD
+git -C "$ctx_repo" checkout -q "$head_sha"
+BASE_SHA="$base_sha" BASE_REF=main HEAD_SHA="$head_sha" \
+REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \
+GITHUB_ACTION_PATH="$ROOT" CONTEXT_FILE=.github/ai-review-context.md \
+  "$ROOT/scripts/prepare-review.sh" > /dev/null
+assert_contains "$ctx_work/review-context.md" "UPDATED context landed on main"
+
+# An unknown BASE_REF falls back to BASE_SHA.
+BASE_SHA="$base_sha" BASE_REF=no-such-branch HEAD_SHA="$head_sha" \
+REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \
+GITHUB_ACTION_PATH="$ROOT" CONTEXT_FILE=.github/ai-review-context.md \
+  "$ROOT/scripts/prepare-review.sh" > /dev/null
+assert_contains "$ctx_work/review-context.md" "Base-branch review context"
+
 # A context file that only exists on the PR head yields NO context.
 BASE_SHA="$base_sha" HEAD_SHA="$head_sha" \
 REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \

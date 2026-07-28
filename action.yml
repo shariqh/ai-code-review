@@ -118,6 +118,7 @@ runs:
       shell: bash
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         REVIEW_REPO_DIR: ${{ github.workspace }}/.ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}

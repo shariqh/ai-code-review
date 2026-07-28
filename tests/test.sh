@@ -119,6 +119,84 @@ GITHUB_OUTPUT="$guard_output" \
 assert_contains "$guard_output" "skip=true"
 assert_contains "$guard_output" "reason=fork"
 
+# Review context comes from the BASE ref: a PR that adds or edits the context
+# file must not be able to steer its own review.
+ctx_repo="$TEMP_DIR/ctx-repo"
+git init -q "$ctx_repo"
+git -C "$ctx_repo" -c user.email=test@test -c user.name=test commit -q --allow-empty -m root
+mkdir -p "$ctx_repo/.github"
+printf 'Base-branch review context: diagrams inline theme vars.\n' \
+  > "$ctx_repo/.github/ai-review-context.md"
+printf 'original\n' > "$ctx_repo/code.txt"
+git -C "$ctx_repo" add -A
+git -C "$ctx_repo" -c user.email=test@test -c user.name=test commit -q -m base
+base_sha=$(git -C "$ctx_repo" rev-parse HEAD)
+printf 'HIJACKED context from the PR head.\n' > "$ctx_repo/.github/ai-review-context.md"
+printf 'changed\n' > "$ctx_repo/code.txt"
+git -C "$ctx_repo" add -A
+git -C "$ctx_repo" -c user.email=test@test -c user.name=test commit -q -m head
+head_sha=$(git -C "$ctx_repo" rev-parse HEAD)
+
+ctx_work="$TEMP_DIR/ctx-work"
+BASE_SHA="$base_sha" HEAD_SHA="$head_sha" \
+REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \
+GITHUB_ACTION_PATH="$ROOT" CONTEXT_FILE=.github/ai-review-context.md \
+  "$ROOT/scripts/prepare-review.sh" > /dev/null
+assert_contains "$ctx_work/review-context.md" "Base-branch review context"
+if grep -Fq "HIJACKED" "$ctx_work/review-context.md"; then
+  fail "review context was read from the PR head, not the base ref"
+fi
+
+# Oversized context is truncated with a note.
+BASE_SHA="$base_sha" HEAD_SHA="$head_sha" \
+REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \
+GITHUB_ACTION_PATH="$ROOT" CONTEXT_FILE=.github/ai-review-context.md \
+CONTEXT_MAX_BYTES=10 \
+  "$ROOT/scripts/prepare-review.sh" > /dev/null
+assert_contains "$ctx_work/review-context.md" "review context truncated at 10 bytes"
+
+# A context file that only exists on the PR head yields NO context.
+BASE_SHA="$base_sha" HEAD_SHA="$head_sha" \
+REVIEW_REPO_DIR="$ctx_repo" REVIEW_WORK_DIR="$ctx_work" \
+GITHUB_ACTION_PATH="$ROOT" CONTEXT_FILE=.github/only-on-head.md \
+  "$ROOT/scripts/prepare-review.sh" > /dev/null
+if [ -s "$ctx_work/review-context.md" ]; then
+  fail "missing context file should yield an empty context"
+fi
+
+# Prompt assembly: with context, the trusted section lands between the static
+# instructions and the diff; without it, the section is absent entirely.
+stub_bin="$TEMP_DIR/stub-bin"
+mkdir -p "$stub_bin"
+cat > "$stub_bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+echo "No issues found."
+STUB
+chmod +x "$stub_bin/copilot"
+
+run_work="$TEMP_DIR/run-work"
+mkdir -p "$run_work/batches"
+printf 'diff --git a/code.txt b/code.txt\n+changed\n' > "$run_work/batches/batch_000.diff"
+printf 'Base-branch review context: diagrams inline theme vars.\n' > "$run_work/review-context.md"
+PATH="$stub_bin:$PATH" \
+COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$run_work" \
+REVIEW_MODEL=stub-model GITHUB_ACTION_PATH="$ROOT" \
+  "$ROOT/scripts/run-review.sh" > /dev/null
+assert_contains "$run_work/prompt.txt" "BEGIN REPO REVIEW CONTEXT"
+assert_contains "$run_work/prompt.txt" "diagrams inline theme vars"
+ctx_line=$(grep -n -- '^--- BEGIN REPO REVIEW CONTEXT ---$' "$run_work/prompt.txt" | cut -d: -f1)
+diff_line=$(grep -n -- '^--- BEGIN DIFF ---$' "$run_work/prompt.txt" | cut -d: -f1)
+[ "$ctx_line" -lt "$diff_line" ] || fail "review context must precede the diff in the prompt"
+
+: > "$run_work/review-context.md"
+PATH="$stub_bin:$PATH" \
+COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$run_work" \
+REVIEW_MODEL=stub-model GITHUB_ACTION_PATH="$ROOT" \
+  "$ROOT/scripts/run-review.sh" > /dev/null
+if grep -Fq "REPO REVIEW CONTEXT" "$run_work/prompt.txt"; then
+  fail "empty context must not add a context section to the prompt"
+fi
+
 install_line=$(grep -n 'npm install --global --ignore-scripts' "$ROOT/action.yml" | cut -d: -f1)
 checkout_line=$(grep -n 'name: Check out pull request' "$ROOT/action.yml" | cut -d: -f1)
 [ "$install_line" -lt "$checkout_line" ] || fail "Copilot CLI must be installed before PR checkout"

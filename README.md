@@ -86,7 +86,23 @@ be present.
 | `file-max-bytes` | `120000` | Per-file review cap |
 | `max-batches` | `8` | Maximum model calls |
 | `owner-only` | `true` | Require the PR author to own the repository |
+| `context-file` | `.github/ai-review-context.md` | Maintainer review context injected into the prompt (base ref only; empty disables) |
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
+
+## Repository review context
+
+The reviewer sees only the diff, so repository conventions it cannot know
+about (theming contracts, intentional patterns) surface as recurring false
+positives. To teach it, commit a `context-file` (default
+`.github/ai-review-context.md`) on the default branch describing those
+conventions and known false positives. When present, its content is injected
+into the prompt as trusted maintainer guidance, ahead of the untrusted diff.
+
+The file is read from the PR **base ref** via `git show`, never from the PR
+head or the checked-out working tree, so a pull request cannot rewrite the
+instructions that review it — edits to the context file take effect only
+after they land on the base branch. Content beyond 16 KB is truncated with a
+note.
 
 ## Security model
 
@@ -102,7 +118,10 @@ be present.
 - Checkout does not persist `GITHUB_TOKEN` credentials.
 - PR contents are checked out into an isolated subdirectory and removed after
   the review, including on persistent self-hosted runners.
-- Copilot receives the diff inline and loads no repository instructions.
+- Copilot receives the diff inline and loads no repository instructions,
+  except the maintainer `context-file`, which is read from the PR base ref
+  only — never from the PR head — so PRs cannot influence their own review
+  prompt.
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and
   GitHub tools are unavailable.
 - Built-in MCP servers and remote session export are disabled.

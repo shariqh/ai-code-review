@@ -44,6 +44,15 @@ inputs:
     description: Restrict reviews to PRs authored by the repository owner
     required: false
     default: "true"
+  context-file:
+    description: >-
+      Repo-relative path to a maintainer-authored review-context file
+      (conventions, known false positives) injected into the review prompt.
+      Read from the PR BASE ref, never the PR head, so a pull request cannot
+      rewrite the instructions that review it. Empty string disables it;
+      a missing file is skipped silently.
+    required: false
+    default: .github/ai-review-context.md
   comment-marker:
     description: Identifier used for the sticky PR comment
     required: false
@@ -115,6 +124,7 @@ runs:
         BATCH_MAX_BYTES: ${{ inputs.batch-max-bytes }}
         FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
         MAX_BATCHES: ${{ inputs.max-batches }}
+        CONTEXT_FILE: ${{ inputs.context-file }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
 
     - name: Run adversarial review

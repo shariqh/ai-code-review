@@ -449,5 +449,23 @@ clean_line=$(grep -n 'name: Clean review workspace' "$ROOT/action.yml" | cut -d:
   && [ "$verify_line" -lt "$clean_line" ] \
   || fail "action steps must run post, result check, verify, then cleanup"
 
+# The reusable workflow runs the action from its own pinned commit, never
+# lets one reviewer cancel another, and verifies by default.
+workflow="$ROOT/.github/workflows/review.yml"
+assert_contains "$workflow" "workflow_call:"
+assert_contains "$workflow" "fail-fast: false"
+assert_contains "$workflow" "repository: \${{ job.workflow_repository }}"
+assert_contains "$workflow" "ref: \${{ job.workflow_sha }}"
+assert_contains "$workflow" "persist-credentials: false"
+assert_contains "$workflow" "path: .ai-code-review-action"
+assert_contains "$workflow" "uses: ./.ai-code-review-action"
+assert_contains "$workflow" "verify-landed: \${{ inputs.verify-landed }}"
+default_models=$(node "$ROOT/tests/check-default-reviewers.mjs" "$workflow")
+[ "$default_models" = "gpt-5.6-sol,gpt-6-astra" ] \
+  || fail "unexpected default reviewers: $default_models"
+assert_contains "$ROOT/examples/reusable-workflow.yml" "pull_request_target:"
+assert_contains "$ROOT/examples/reusable-workflow.yml" \
+  "COPILOT_REVIEW_PAT: \${{ secrets.COPILOT_REVIEW_PAT }}"
+
 suite_finished=true
 echo "All tests passed."

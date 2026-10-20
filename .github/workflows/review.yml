@@ -1,0 +1,157 @@
+name: AI code review (reusable)
+
+# Reusable workflow: one review job per reviewer, each with its own model,
+# sticky PR comment and concurrency queue. Call it from a pull_request_target
+# workflow in the consuming repository; examples/reusable-workflow.yml shows
+# the calling job and the README documents the inputs.
+#
+# Each reviewer job checks out this repository at the commit the caller
+# pinned (job.workflow_sha) and runs the composite action from that checkout,
+# so pinning this workflow by SHA also pins the action code it runs.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner for every review job: one label such as ubuntu-latest, or
+          JSON such as ["self-hosted","copilot-review"].
+        type: string
+        default: ubuntu-latest
+      reviewers:
+        description: >-
+          JSON array with one entry per reviewer. Each entry needs a model and
+          a marker that no other reviewer uses, and may set name (the job
+          name, defaulting to the model), timeout-minutes, reasoning-effort
+          and context.
+        type: string
+        default: >-
+          [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"},
+          {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
+          "timeout-minutes": 40}]
+      timeout-minutes:
+        description: Job timeout for reviewers that do not set their own
+        type: number
+        default: 20
+      cancel-in-progress:
+        description: >-
+          Cancel a reviewer's running job when a newer push arrives. Off by
+          default: under a fast push cadence, cancelling can stop every
+          review from finishing.
+        type: boolean
+        default: false
+      verify-landed:
+        description: >-
+          Fail a reviewer's job unless its sticky comment covers the pull
+          request's current head from this run
+        type: boolean
+        default: true
+      copilot-cli-version:
+        description: Exact @github/copilot package version
+        type: string
+        default: 1.0.74
+      node-version:
+        description: Node.js version passed to actions/setup-node
+        type: string
+        default: lts/*
+      reasoning-effort:
+        description: Reasoning effort for reviewers that do not set their own
+        type: string
+        default: high
+      context:
+        description: Context tier for reviewers that do not set their own
+        type: string
+        default: long_context
+      batch-max-bytes:
+        description: Target maximum bytes per review batch
+        type: number
+        default: 50000
+      file-max-bytes:
+        description: Maximum bytes reviewed from one changed file
+        type: number
+        default: 120000
+      max-batches:
+        description: Maximum model calls per reviewer per pull request
+        type: number
+        default: 8
+      owner-only:
+        description: Restrict reviews to PRs authored by the repository owner
+        type: boolean
+        default: true
+      context-file:
+        description: >-
+          Repo-relative maintainer review-context file, read from the base
+          branch only. An empty string disables it.
+        type: string
+        default: .github/ai-review-context.md
+    secrets:
+      COPILOT_REVIEW_PAT:
+        description: >-
+          Fine-grained PAT with the Copilot Requests permission. When it is
+          absent the review is skipped with a warning.
+        required: false
+
+jobs:
+  review:
+    name: ${{ matrix.reviewer.name || matrix.reviewer.model }}
+    runs-on: >-
+      ${{
+        (startsWith(inputs.runs-on, '[') || startsWith(inputs.runs-on, '{') ||
+        startsWith(inputs.runs-on, '"')) && fromJSON(inputs.runs-on) ||
+        inputs.runs-on
+      }}
+    timeout-minutes: ${{ matrix.reviewer.timeout-minutes || inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      # One reviewer failing (a retired model, a stale head) must not cancel
+      # the others.
+      fail-fast: false
+      matrix:
+        reviewer: ${{ fromJSON(inputs.reviewers) }}
+    # One queue per reviewer and pull request, so reviewers never cancel or
+    # wait for each other. With cancel-in-progress off, a running review
+    # always finishes and a newer push waits as the single pending run.
+    concurrency:
+      group: ${{ matrix.reviewer.marker }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: ${{ inputs.cancel-in-progress }}
+    steps:
+      - name: Resolve this workflow's commit
+        shell: bash
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          if ! [[ "$WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || ! [[ "$WORKFLOW_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::job.workflow_repository and job.workflow_sha are unavailable ('$WORKFLOW_REPOSITORY', '$WORKFLOW_SHA'). This workflow runs the review action from its own commit, which needs GitHub.com and Actions runner v2.334.0 or newer."
+            exit 1
+          fi
+          echo "review action: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+
+      - name: Check out the review action at this workflow's commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ai-code-review-action
+          persist-credentials: false
+
+      - name: Review with ${{ matrix.reviewer.model }}
+        uses: ./.ai-code-review-action
+        with:
+          copilot-token: ${{ secrets.COPILOT_REVIEW_PAT }}
+          github-token: ${{ github.token }}
+          model: ${{ matrix.reviewer.model }}
+          comment-marker: ${{ matrix.reviewer.marker }}
+          reasoning-effort: ${{ matrix.reviewer.reasoning-effort || inputs.reasoning-effort }}
+          context: ${{ matrix.reviewer.context || inputs.context }}
+          copilot-cli-version: ${{ inputs.copilot-cli-version }}
+          node-version: ${{ inputs.node-version }}
+          batch-max-bytes: ${{ inputs.batch-max-bytes }}
+          file-max-bytes: ${{ inputs.file-max-bytes }}
+          max-batches: ${{ inputs.max-batches }}
+          owner-only: ${{ inputs.owner-only }}
+          context-file: ${{ inputs.context-file }}
+          verify-landed: ${{ inputs.verify-landed }}

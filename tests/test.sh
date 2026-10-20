@@ -3,12 +3,20 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
+# The suite passes only if it reaches the end. A syntax error in a sourced
+# script stops bash without tripping set -e, and the cleanup would otherwise
+# supply the exit status.
+suite_finished=false
+trap 'rm -rf "$TEMP_DIR"; [ "$suite_finished" = true ] || exit 1' EXIT
 
 fail() {
   echo "FAIL: $1" >&2
   exit 1
 }
+
+for script in "$ROOT"/scripts/*.sh; do
+  bash -n "$script" || fail "$script has a syntax error"
+done
 
 assert_contains() {
   local file=$1
@@ -81,43 +89,58 @@ node "$ROOT/scripts/truncate-comment.mjs" \
 assert_contains "$TEMP_DIR/truncated.md" "Review output truncated"
 
 guard_output="$TEMP_DIR/guard.out"
-EVENT_NAME=pull_request_target \
-REPOSITORY=shariqh/example \
-REPOSITORY_OWNER=shariqh \
-WORKFLOW_ACTOR=shariqh \
-WORKFLOW_TRIGGERING_ACTOR=shariqh \
-PR_AUTHOR=shariqh \
-PR_BASE_SHA=base \
-PR_HEAD_SHA=head \
-PR_HEAD_REPOSITORY=shariqh/example \
-PR_NUMBER=1 \
-PR_DRAFT=false \
-OWNER_ONLY=true \
-COPILOT_GITHUB_TOKEN=copilot-token \
-REVIEW_GITHUB_TOKEN=github-token \
-GITHUB_OUTPUT="$guard_output" \
-  "$ROOT/scripts/guard.sh"
+
+# Runs guard.sh for an eligible owner PR; later NAME=value arguments override
+# the defaults (env applies them in order).
+run_guard() {
+  : > "$guard_output"
+  env \
+    EVENT_NAME=pull_request_target \
+    REPOSITORY=shariqh/example \
+    REPOSITORY_OWNER=shariqh \
+    WORKFLOW_ACTOR=shariqh \
+    WORKFLOW_TRIGGERING_ACTOR=shariqh \
+    PR_AUTHOR=shariqh \
+    PR_BASE_SHA=base \
+    PR_HEAD_SHA=head \
+    PR_HEAD_REPOSITORY=shariqh/example \
+    PR_NUMBER=1 \
+    PR_DRAFT=false \
+    OWNER_ONLY=true \
+    VERIFY_LANDED=false \
+    REVIEW_MODEL=gpt-5.6-sol \
+    COMMENT_MARKER=ai-code-review-sticky \
+    COPILOT_GITHUB_TOKEN=copilot-token \
+    REVIEW_GITHUB_TOKEN=github-token \
+    GITHUB_OUTPUT="$guard_output" \
+    "$@" \
+    "$ROOT/scripts/guard.sh"
+}
+
+run_guard > /dev/null
 assert_contains "$guard_output" "skip=false"
 
-: > "$guard_output"
-EVENT_NAME=pull_request \
-REPOSITORY=shariqh/example \
-REPOSITORY_OWNER=shariqh \
-WORKFLOW_ACTOR=contributor \
-WORKFLOW_TRIGGERING_ACTOR=contributor \
-PR_AUTHOR=contributor \
-PR_BASE_SHA=base \
-PR_HEAD_SHA=head \
-PR_HEAD_REPOSITORY=contributor/example \
-PR_NUMBER=2 \
-PR_DRAFT=false \
-OWNER_ONLY=false \
-COPILOT_GITHUB_TOKEN=copilot-token \
-REVIEW_GITHUB_TOKEN=github-token \
-GITHUB_OUTPUT="$guard_output" \
-  "$ROOT/scripts/guard.sh"
+run_guard \
+  EVENT_NAME=pull_request \
+  WORKFLOW_ACTOR=contributor \
+  WORKFLOW_TRIGGERING_ACTOR=contributor \
+  PR_AUTHOR=contributor \
+  PR_HEAD_REPOSITORY=contributor/example \
+  PR_NUMBER=2 \
+  OWNER_ONLY=false > /dev/null
 assert_contains "$guard_output" "skip=true"
 assert_contains "$guard_output" "reason=fork"
+
+# Configuration errors fail the job, and do so before any eligibility skip,
+# so a draft or fork PR cannot hide a misconfigured reviewer.
+guard_errors="$TEMP_DIR/guard.err"
+for bad_setting in REVIEW_MODEL= 'REVIEW_MODEL=gpt 5' \
+  COMMENT_MARKER= 'COMMENT_MARKER=bad marker' VERIFY_LANDED=yes; do
+  if run_guard "$bad_setting" PR_DRAFT=true > "$guard_errors" 2>&1; then
+    fail "guard accepted $bad_setting"
+  fi
+  assert_contains "$guard_errors" "::error::"
+done
 
 # Review context comes from the BASE ref: a PR that adds or edits the context
 # file must not be able to steer its own review.
@@ -220,6 +243,194 @@ if grep -Fq "REPO REVIEW CONTEXT" "$run_work/prompt.txt"; then
   fail "empty context must not add a context section to the prompt"
 fi
 
+# A clean run records its call counts, and check-result passes quietly.
+[ "$(cat "$run_work/review.attempted")" = "1" ] || fail "expected one attempted call"
+[ "$(cat "$run_work/review.completed")" = "1" ] || fail "expected one completed call"
+REVIEW_WORK_DIR="$run_work" "$ROOT/scripts/check-result.sh" > "$TEMP_DIR/check.out" \
+  || fail "check-result failed a clean run"
+if grep -Fq "::" "$TEMP_DIR/check.out"; then
+  fail "check-result annotated a clean run"
+fi
+
+# A failed call shows the CLI's stderr in the log: control sequences removed,
+# token-like strings redacted, and every line prefixed so nothing the CLI
+# echoes can start a workflow command.
+failing_bin="$TEMP_DIR/failing-bin"
+mkdir -p "$failing_bin"
+cat > "$failing_bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+escape_character=$(printf '\033')
+printf '%s[31mError: Model "gpt-5.4" from --model flag is not available.%s[0m\n' \
+  "$escape_character" "$escape_character" >&2
+printf '::add-mask::injected\n' >&2
+printf 'leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 and %s\n' \
+  "$COPILOT_GITHUB_TOKEN" >&2
+exit 1
+STUB
+chmod +x "$failing_bin/copilot"
+
+fail_work="$TEMP_DIR/fail-work"
+mkdir -p "$fail_work/batches"
+printf 'diff --git a/a.txt b/a.txt\n+a\n' > "$fail_work/batches/batch_000.diff"
+printf 'diff --git a/b.txt b/b.txt\n+b\n' > "$fail_work/batches/batch_001.diff"
+: > "$fail_work/review-context.md"
+PATH="$failing_bin:$PATH" \
+COPILOT_GITHUB_TOKEN=stub-secret-token-value REVIEW_WORK_DIR="$fail_work" \
+REVIEW_MODEL=gpt-5.4 GITHUB_ACTION_PATH="$ROOT" \
+  "$ROOT/scripts/run-review.sh" > "$TEMP_DIR/fail-run.out"
+assert_contains "$TEMP_DIR/fail-run.out" \
+  'copilot stderr | Error: Model "gpt-5.4" from --model flag is not available.'
+assert_contains "$TEMP_DIR/fail-run.out" "copilot stderr | ::add-mask::injected"
+if grep -Fq "ghp_abcdefghijklmnopqrstuvwxyz0123456789" "$TEMP_DIR/fail-run.out"; then
+  fail "a GitHub token reached the job log"
+fi
+if grep -Fq "stub-secret-token-value" "$TEMP_DIR/fail-run.out"; then
+  fail "the COPILOT_GITHUB_TOKEN value reached the job log"
+fi
+if grep -Eq '^[[:space:]]*::' "$TEMP_DIR/fail-run.out"; then
+  fail "CLI stderr could start a workflow command"
+fi
+if grep -q "$(printf '\033')" "$TEMP_DIR/fail-run.out"; then
+  fail "terminal escape sequences reached the job log"
+fi
+[ "$(cat "$fail_work/review.attempted")" = "2" ] || fail "expected two attempted calls"
+[ "$(cat "$fail_work/review.completed")" = "0" ] || fail "expected no completed calls"
+assert_contains "$fail_work/review.failures" "review call failed (exit 1"
+assert_contains "$fail_work/review.md" "every review call failed"
+
+# When every call failed, check-result fails the job (the sticky comment has
+# already been posted by then).
+if REVIEW_WORK_DIR="$fail_work" "$ROOT/scripts/check-result.sh" > "$TEMP_DIR/check.out"; then
+  fail "check-result passed a run in which every call failed"
+fi
+assert_contains "$TEMP_DIR/check.out" "::error::every review call failed (2 of 2)"
+
+# A partial failure warns but passes.
+flaky_bin="$TEMP_DIR/flaky-bin"
+mkdir -p "$flaky_bin"
+cat > "$flaky_bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+calls=$(cat "$STUB_CALLS_FILE" 2>/dev/null || echo 0)
+calls=$((calls + 1))
+echo "$calls" > "$STUB_CALLS_FILE"
+if [ "$calls" -eq 1 ]; then
+  echo "Error: rate limited" >&2
+  exit 1
+fi
+echo "No issues found."
+STUB
+chmod +x "$flaky_bin/copilot"
+PATH="$flaky_bin:$PATH" STUB_CALLS_FILE="$TEMP_DIR/flaky.calls" \
+COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$fail_work" \
+REVIEW_MODEL=stub-model GITHUB_ACTION_PATH="$ROOT" \
+  "$ROOT/scripts/run-review.sh" > /dev/null
+[ "$(cat "$fail_work/review.completed")" = "1" ] || fail "expected one completed call"
+REVIEW_WORK_DIR="$fail_work" "$ROOT/scripts/check-result.sh" > "$TEMP_DIR/check.out" \
+  || fail "check-result failed a partial review"
+assert_contains "$TEMP_DIR/check.out" "::warning::1 of 2 review calls failed"
+
+# No batches means nothing to review, which is not a failure.
+empty_work="$TEMP_DIR/empty-work"
+mkdir -p "$empty_work/batches"
+: > "$empty_work/review-context.md"
+PATH="$stub_bin:$PATH" \
+COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$empty_work" \
+REVIEW_MODEL=stub-model GITHUB_ACTION_PATH="$ROOT" \
+  "$ROOT/scripts/run-review.sh" > /dev/null
+REVIEW_WORK_DIR="$empty_work" "$ROOT/scripts/check-result.sh" > /dev/null \
+  || fail "check-result failed a review with no batches"
+assert_contains "$empty_work/review.md" "No issues found."
+
+# Missing counts fail closed.
+missing_work="$TEMP_DIR/missing-work"
+mkdir -p "$missing_work"
+if REVIEW_WORK_DIR="$missing_work" "$ROOT/scripts/check-result.sh" > /dev/null; then
+  fail "check-result passed without call counts"
+fi
+
+# verify-landed.sh against a stand-in for `gh api` that answers its three
+# calls: the PR head (first and final reads), the matching sticky ids, and a
+# sticky body by id.
+gh_bin="$TEMP_DIR/gh-bin"
+mkdir -p "$gh_bin"
+cat > "$gh_bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" != "api" ]; then
+  echo "unexpected gh call: $*" >&2
+  exit 1
+fi
+case "$2" in
+  repos/*/pulls/*)
+    reads=$(cat "$STUB_DIR/head.reads" 2>/dev/null || echo 0)
+    reads=$((reads + 1))
+    echo "$reads" > "$STUB_DIR/head.reads"
+    if [ "$reads" -eq 1 ]; then echo "$STUB_HEAD_FIRST"; else echo "$STUB_HEAD_FINAL"; fi
+    ;;
+  repos/*/issues/comments/*)
+    cat "$STUB_DIR/comment-${2##*/}"
+    ;;
+  repos/*/issues/*/comments)
+    cat "$STUB_DIR/ids"
+    ;;
+  *)
+    echo "unexpected gh api path: $2" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$gh_bin/gh"
+
+verify_head=1111111111111111111111111111111111111111
+other_head=2222222222222222222222222222222222222222
+sticky_body() {
+  printf '%s\n' \
+    "<!-- ai-code-review-sticky -->" \
+    "## AI code review (\`gpt-5.6-sol\` via Copilot CLI)" \
+    "" \
+    "_Reviewed commit: \`$1\`_" \
+    "" \
+    "<!-- ai-code-review-run: $2 -->"
+}
+
+# usage: run_verify <first head> <final head> <sticky ids> <body of sticky 55>
+run_verify() {
+  local stub_dir
+  stub_dir=$(mktemp -d "$TEMP_DIR/verify.XXXXXX")
+  printf '%s' "$3" > "$stub_dir/ids"
+  printf '%s\n' "$4" > "$stub_dir/comment-55"
+  sticky_body "$other_head" 4242 > "$stub_dir/comment-12"
+  PATH="$gh_bin:$PATH" STUB_DIR="$stub_dir" \
+  STUB_HEAD_FIRST="$1" STUB_HEAD_FINAL="$2" \
+  GH_TOKEN=stub REPOSITORY=shariqh/example PR_NUMBER=7 \
+  HEAD_SHA="$verify_head" RUN_ID=4242 COMMENT_MARKER=ai-code-review-sticky \
+    "$ROOT/scripts/verify-landed.sh" > "$TEMP_DIR/verify.out" 2>&1
+}
+
+run_verify "$verify_head" "$verify_head" $'12\n55\n' "$(sticky_body "$verify_head" 4242)" \
+  || fail "verify-landed rejected a sticky that covers the head"
+assert_contains "$TEMP_DIR/verify.out" "verified: sticky comment 55 covers head $verify_head"
+
+expect_verify_failure() {
+  local label=$1
+  local message=$2
+  shift 2
+  if run_verify "$@"; then
+    fail "verify-landed accepted $label"
+  fi
+  assert_contains "$TEMP_DIR/verify.out" "$message"
+}
+expect_verify_failure "a moved head" "PR head moved during this run" \
+  "$other_head" "$verify_head" $'55\n' "$(sticky_body "$verify_head" 4242)"
+expect_verify_failure "a missing sticky" "no sticky comment" \
+  "$verify_head" "$verify_head" "" "$(sticky_body "$verify_head" 4242)"
+expect_verify_failure "a sticky for another commit" "does not reflect this run" \
+  "$verify_head" "$verify_head" $'55\n' "$(sticky_body "$other_head" 4242)"
+expect_verify_failure "a sticky from another run" "does not reflect this run" \
+  "$verify_head" "$verify_head" $'55\n' "$(sticky_body "$verify_head" 4241)"
+expect_verify_failure "a head that moved during the check" "moved while this check ran" \
+  "$verify_head" "$other_head" $'55\n' "$(sticky_body "$verify_head" 4242)"
+
 install_line=$(grep -n 'npm install --global --ignore-scripts' "$ROOT/action.yml" | cut -d: -f1)
 checkout_line=$(grep -n 'name: Check out pull request' "$ROOT/action.yml" | cut -d: -f1)
 [ "$install_line" -lt "$checkout_line" ] || fail "Copilot CLI must be installed before PR checkout"
@@ -228,4 +439,15 @@ assert_contains "$ROOT/action.yml" "working-directory: \${{ runner.temp }}"
 assert_contains "$ROOT/action.yml" "path: .ai-code-review-pr-"
 assert_contains "$ROOT/examples/ai-code-review.yml" "pull_request_target:"
 
+# The sticky comment is posted before the job is failed or verified, and the
+# workspace is cleaned last.
+post_line=$(grep -n 'name: Post sticky review comment' "$ROOT/action.yml" | cut -d: -f1)
+result_line=$(grep -n 'name: Fail when every review call failed' "$ROOT/action.yml" | cut -d: -f1)
+verify_line=$(grep -n "name: Verify the review landed on this run's head" "$ROOT/action.yml" | cut -d: -f1)
+clean_line=$(grep -n 'name: Clean review workspace' "$ROOT/action.yml" | cut -d: -f1)
+[ "$post_line" -lt "$result_line" ] && [ "$result_line" -lt "$verify_line" ] \
+  && [ "$verify_line" -lt "$clean_line" ] \
+  || fail "action steps must run post, result check, verify, then cleanup"
+
+suite_finished=true
 echo "All tests passed."

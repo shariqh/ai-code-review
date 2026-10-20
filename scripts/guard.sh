@@ -16,6 +16,35 @@ case "${OWNER_ONLY:-true}" in
     ;;
 esac
 
+case "${VERIFY_LANDED:-false}" in
+  true|false) ;;
+  *)
+    echo "::error::verify-landed must be true or false"
+    exit 1
+    ;;
+esac
+
+case "${ALLOW_MISSING_TOKEN:-false}" in
+  true|false) ;;
+  *)
+    echo "::error::allow-missing-token must be true or false"
+    exit 1
+    ;;
+esac
+
+# Checked before any skip, so a misconfigured reviewer fails loudly on its
+# first run rather than on the first PR that is eligible for review. An empty
+# model must never reach the CLI, which would fall back to its own default.
+if ! [[ "${REVIEW_MODEL:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "::error::model must be a Copilot CLI model identifier such as gpt-5.6-sol"
+  exit 1
+fi
+
+if ! [[ "${COMMENT_MARKER:-}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "::error::comment-marker may contain only letters, numbers, underscores, and hyphens"
+  exit 1
+fi
+
 case "${EVENT_NAME:-}" in
   pull_request|pull_request_target) ;;
   *) skip "AI code review only runs for pull request events." "not-pull-request" ;;
@@ -48,6 +77,13 @@ if [ "$OWNER_ONLY" = "true" ] \
 fi
 
 if [ -z "${COPILOT_GITHUB_TOKEN:-}" ]; then
+  # With verify-landed on, the caller asked for a job that fails unless a
+  # review landed, so a missing token must not turn into a green skip.
+  if [ "${VERIFY_LANDED:-false}" = "true" ] \
+    && [ "${ALLOW_MISSING_TOKEN:-false}" != "true" ]; then
+    echo "::error::COPILOT_REVIEW_PAT is not set, so this pull request cannot be reviewed. Add the secret, or set allow-missing-token to skip instead."
+    exit 1
+  fi
   echo "::warning::COPILOT_REVIEW_PAT is not set; skipping AI code review."
   echo "skip=true" >> "$GITHUB_OUTPUT"
   echo "reason=missing-copilot-token" >> "$GITHUB_OUTPUT"

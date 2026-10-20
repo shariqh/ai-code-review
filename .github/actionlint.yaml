@@ -1,0 +1,8 @@
+# actionlint (v1.7.12 and earlier) predates the job.workflow_* context
+# properties, which GitHub documents in the contexts reference and Actions
+# runner v2.334.0 provides. The reusable workflow reads two of them to check
+# out its own commit.
+paths:
+  .github/workflows/review.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'

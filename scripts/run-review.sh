@@ -25,6 +25,7 @@ cd "$REVIEW_WORK_DIR"
 : > review.md
 : > review.failures
 findings=0
+attempted=0
 completed=0
 
 echo "using model: $REVIEW_MODEL"
@@ -32,6 +33,7 @@ echo "context: $CONTEXT_TIER; reasoning effort: $REASONING_EFFORT"
 
 for batch in batches/batch_*.diff; do
   [ -s "$batch" ] || continue
+  attempted=$((attempted + 1))
   echo "reviewing $batch ($(wc -c < "$batch") bytes)"
 
   cat > prompt.txt <<'PROMPT'
@@ -99,18 +101,33 @@ PROMPT
     --no-remote-export \
     --silent \
     > batch.raw 2> batch.err; then
-    completed=$((completed + 1))
+    :
   else
     exit_code=$?
-    echo "batch failed (exit $exit_code)"
+    # The CLI reports why it failed (a model the seat no longer offers, an
+    # expired token, a rate limit) only on stderr, so show it here.
+    echo "batch failed (exit $exit_code); Copilot CLI stderr:"
+    print_cli_stderr batch.err
     printf '%s\n' \
-      "- \`$batch\` - review call failed (exit $exit_code); its files were NOT reviewed" \
+      "- \`$batch\` - review call failed (exit $exit_code; the Copilot CLI error is in the job log); its files were NOT reviewed" \
       >> review.failures
     continue
   fi
 
   escape_character=$(printf '\033')
   sed "s/${escape_character}\\[[0-9;]*m//g" batch.raw > batch.md
+
+  # A call that exits 0 with nothing to say reviewed nothing. Counting it as
+  # completed would read as "No issues found".
+  if [ -z "$(tr -d '[:space:]' < batch.md)" ]; then
+    echo "batch returned an empty reply; Copilot CLI stderr:"
+    print_cli_stderr batch.err
+    printf '%s\n' \
+      "- \`$batch\` - review call returned an empty reply; its files were NOT reviewed" \
+      >> review.failures
+    continue
+  fi
+  completed=$((completed + 1))
 
   if is_clean_review batch.md; then
     echo "no issues"
@@ -121,6 +138,12 @@ PROMPT
   printf '\n' >> review.md
   findings=$((findings + 1))
 done
+
+# Read by check-result.sh, which fails the job once the sticky comment has
+# been posted if no call succeeded.
+printf '%s\n' "$attempted" > review.attempted
+printf '%s\n' "$completed" > review.completed
+echo "review calls completed: $completed of $attempted"
 
 if [ "$findings" -eq 0 ]; then
   if [ -s review.failures ]; then

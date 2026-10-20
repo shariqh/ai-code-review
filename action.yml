@@ -57,6 +57,20 @@ inputs:
     description: Identifier used for the sticky PR comment
     required: false
     default: ai-code-review-sticky
+  verify-landed:
+    description: >-
+      Fail the job unless the sticky comment now covers the pull request's
+      current head from this run attempt. With this on, a missing
+      copilot-token also fails the job (see allow-missing-token). The
+      reusable workflow turns this on.
+    required: false
+    default: "false"
+  allow-missing-token:
+    description: >-
+      Skip with a warning instead of failing when copilot-token is empty and
+      verify-landed is on. For smoke tests that run without the secret.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -77,6 +91,10 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_DRAFT: ${{ github.event.pull_request.draft }}
         OWNER_ONLY: ${{ inputs.owner-only }}
+        VERIFY_LANDED: ${{ inputs.verify-landed }}
+        ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
+        REVIEW_MODEL: ${{ inputs.model }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
         REVIEW_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: "$GITHUB_ACTION_PATH/scripts/guard.sh"
@@ -149,10 +167,31 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
         REVIEW_MODEL: ${{ inputs.model }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
       run: "$GITHUB_ACTION_PATH/scripts/post-comment.sh"
+
+    - name: Fail when every review call failed
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+      run: "$GITHUB_ACTION_PATH/scripts/check-result.sh"
+
+    - name: Verify the review landed on this run's head
+      if: steps.guard.outputs.skip == 'false' && inputs.verify-landed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
+      run: "$GITHUB_ACTION_PATH/scripts/verify-landed.sh"
 
     - name: Clean review workspace
       if: always() && steps.guard.outputs.skip == 'false'

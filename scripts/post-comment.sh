@@ -6,12 +6,17 @@ set -euo pipefail
 : "${PR_NUMBER:?PR_NUMBER is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 : "${RUN_ID:?RUN_ID is required}"
+: "${RUN_ATTEMPT:?RUN_ATTEMPT is required}"
 : "${REVIEW_MODEL:?REVIEW_MODEL is required}"
 : "${REVIEW_WORK_DIR:?REVIEW_WORK_DIR is required}"
 
 COMMENT_MARKER=${COMMENT_MARKER:-ai-code-review-sticky}
 if ! [[ "$COMMENT_MARKER" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "::error::comment-marker may contain only letters, numbers, underscores, and hyphens"
+  exit 1
+fi
+if ! [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::RUN_ATTEMPT must be a positive integer"
   exit 1
 fi
 
@@ -27,6 +32,9 @@ marker="<!-- $COMMENT_MARKER -->"
   echo "_Reviewed commit: \`$HEAD_SHA\`_"
   echo
   echo "<!-- ai-code-review-run: $RUN_ID -->"
+  echo "<!-- ai-code-review-attempt: $RUN_ATTEMPT -->"
+  # The result marker ends the header that sticky_header_fields reads; model
+  # output only ever follows it.
   if is_complete_clean_review "$REVIEW_WORK_DIR"; then
     echo "<!-- ai-code-review-result: clean -->"
   else
@@ -53,8 +61,11 @@ marker="<!-- $COMMENT_MARKER -->"
 node "$GITHUB_ACTION_PATH/scripts/truncate-comment.mjs" \
   comment.full.md comment.md 60000
 
+# This reviewer's stickies only: a bot comment whose first line is its marker.
+# Another reviewer's sticky can quote the marker in its findings, and must not
+# be updated or deleted here.
 ids=$(gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
-  --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id")
+  --jq "$(sticky_ids_jq "$COMMENT_MARKER")")
 
 if ! current_head=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha); then
   echo "::error::could not read the current pull request head"

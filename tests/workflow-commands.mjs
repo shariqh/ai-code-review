@@ -1,11 +1,13 @@
 // Reads a step's log output and prints every workflow command the Actions
 // runner would process from it, other than ::stop-commands:: and its resume
-// token, as "line <n>: <command>". It follows the runner's
+// token, as "line <n>: <command>" (lowercased). It follows the runner's
 // ActionCommandManager: ActionCommand.TryParseV2 (`::name ...::data`, at the
 // start of the line after leading whitespace) is tried first, then the
 // legacy ActionCommand.TryParse (`##[name ...]data`, found anywhere in the
-// line). Either form counts only for a registered command name, and while
-// commands are stopped only the stop token resumes them.
+// line). Either form counts only for a registered command name, compared
+// case-insensitively (OrdinalIgnoreCase), as are stop-commands and its
+// resume token; while commands are stopped only that token resumes them.
+// Output is split into lines the way the runner reads it: at CR, LF or CRLF.
 import { readFileSync } from "node:fs";
 
 const [logPath] = process.argv.slice(2);
@@ -21,7 +23,7 @@ const registered = new Set([
 
 function commandName(info) {
   const space = info.indexOf(" ");
-  return space < 0 ? info : info.slice(0, space);
+  return (space < 0 ? info : info.slice(0, space)).toLowerCase();
 }
 
 function parseV2(line) {
@@ -41,7 +43,7 @@ function parseV1(line) {
 }
 
 let stopToken = null;
-readFileSync(logPath, "utf8").split("\n").forEach((line, index) => {
+readFileSync(logPath, "utf8").split(/\r\n|\r|\n/).forEach((line, index) => {
   const command = [parseV2(line), parseV1(line)]
     .find((candidate) => candidate && registered.has(candidate.name));
   if (!command) return;
@@ -53,7 +55,7 @@ readFileSync(logPath, "utf8").split("\n").forEach((line, index) => {
     return;
   }
   if (command.name === "stop-commands") {
-    stopToken = command.data;
+    stopToken = command.data.toLowerCase();
     registered.add(stopToken);
     return;
   }

@@ -208,15 +208,17 @@ be present.
 A failed model call is listed in the sticky comment's **Incomplete review**
 note, and the Copilot CLI's error output is printed in the job log under the
 review step, at most 4,000 bytes and 40 lines, with token-like strings
-redacted. A call that exits successfully with an empty reply counts as
-failed too, since it reviewed nothing. If every call failed, the job fails
-after posting the comment, so nothing reports success over a review that
-never happened; a partial failure is a warning.
+redacted and punctuation outside a small allowlist shown as `?`. A call that
+exits successfully with an empty reply counts as failed too, since it
+reviewed nothing. If every call failed, the job fails after posting the
+comment, so nothing reports success over a review that never happened; a
+partial failure is a warning.
 
 A model that the Copilot seat no longer offers fails every call within
-seconds with `Error: Model "<id>" from --model flag is not available.` (this
-is how `gpt-5.4` stopped working in October 2026). Switch that reviewer to a
-model the seat offers.
+seconds with `Error: Model "<id>" from --model flag is not available.`,
+which the log shows as `Error? Model "<id>" from --model flag is not
+available.` This is how `gpt-5.4` stopped working in October 2026. Switch
+that reviewer to a model the seat offers.
 
 ## Repository review context
 
@@ -259,12 +261,15 @@ truncated with a note.
 - Built-in MCP servers and remote session export are disabled.
 - `COPILOT_GITHUB_TOKEN` is marked as a secret environment variable so it is
   removed from tool environments and redacted from output. CLI error output
-  printed after a failed call is also stripped of token-like strings, and
-  because it can quote the diff it is printed inside a `::stop-commands::`
-  block whose resume token is random for every call: the runner processes no
-  workflow command from it, neither `::command::` nor the legacy
-  `##[command]` form, which the runner recognises anywhere in a line. Each
-  line also carries a prefix.
+  printed after a failed call is also stripped of token-like strings. Because
+  it can quote the diff, every character outside a small allowlist (letters,
+  digits, space and `. , _ - ' " /` `=`) becomes `?`, so no colon, `#`,
+  bracket or parenthesis survives. That leaves nothing for the runner's
+  workflow commands (`::command::`, or the legacy `##[command]` anywhere in a
+  line) or for the problem matchers setup-node registers (eslint-compact,
+  eslint-stylish, tsc) to act on. As defence in depth it is printed inside a
+  `::stop-commands::` block with a random per-call resume token, which stops
+  commands but not matchers, and each line carries a prefix.
 - The reusable workflow checks out this repository at its own pinned commit
   without persisting credentials, and requests only `contents: read` and
   `pull-requests: write`.

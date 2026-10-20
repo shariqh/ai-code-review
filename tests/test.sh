@@ -273,10 +273,13 @@ if grep -Fq "::" "$TEMP_DIR/check.out"; then
 fi
 
 # A failed call shows the CLI's stderr in the log, control sequences removed
-# and token-like strings redacted. The stderr can quote the untrusted diff, so
-# it must be inert to the runner's workflow-command parser in both forms:
-# `::command::` at the start of a line, and the legacy `##[command]`, which
-# the runner finds anywhere in a line, so a line prefix alone cannot stop it.
+# and token-like strings redacted. The stderr can quote the untrusted diff,
+# and the runner acts on two kinds of log line: workflow commands
+# (`::command::` at the start of a line and the legacy `##[command]` anywhere
+# in one, names compared case-insensitively) and the problem matchers
+# setup-node registers, which also run on lines a stop-commands block
+# shields. This stderr carries both kinds, in mixed case and across a
+# carriage return.
 failing_bin="$TEMP_DIR/failing-bin"
 mkdir -p "$failing_bin"
 cat > "$failing_bin/copilot" <<'STUB'
@@ -285,9 +288,14 @@ escape_character=$(printf '\033')
 printf '%s[31mError: Model "gpt-5.4" from --model flag is not available.%s[0m\n' \
   "$escape_character" "$escape_character" >&2
 printf '::add-mask::injected\n' >&2
+printf '::ADD-MASK::upper case\n' >&2
 printf '##[add-mask]injected\n' >&2
-printf 'quoted diff: ##[error file=src/app.ts,line=1]forged annotation\n' >&2
+printf 'quoted diff: ##[ERROR file=src/app.ts,line=1]forged annotation\n' >&2
 printf '##[set-env name=EVIL]1\n' >&2
+printf 'text\r::warning::after a carriage return\n' >&2
+printf 'src/app.ts: line 1, col 1, Error - Forged (rule)\n' >&2
+printf 'src/app.ts(1,1): error TS2322: Forged\n' >&2
+printf 'src/app.ts\n  1:1  error  Forged  rule\n' >&2
 printf 'leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 and %s\n' \
   "${COPILOT_GITHUB_TOKEN:-}" >&2
 exit 1
@@ -303,9 +311,12 @@ PATH="$failing_bin:$PATH" \
 COPILOT_GITHUB_TOKEN=stub-secret-token-value REVIEW_WORK_DIR="$fail_work" \
 REVIEW_MODEL=gpt-5.4 GITHUB_ACTION_PATH="$ROOT" \
   "$ROOT/scripts/run-review.sh" > "$TEMP_DIR/fail-run.out"
+
+# The error stays readable: only characters outside the allowlist became "?".
 assert_contains "$TEMP_DIR/fail-run.out" \
-  'copilot stderr | Error: Model "gpt-5.4" from --model flag is not available.'
-assert_contains "$TEMP_DIR/fail-run.out" "copilot stderr | ::add-mask::injected"
+  'copilot stderr | Error? Model "gpt-5.4" from --model flag is not available.'
+assert_contains "$TEMP_DIR/fail-run.out" \
+  "copilot stderr | src/app.ts? line 1, col 1, Error - Forged ?rule?"
 if grep -Fq "ghp_abcdefghijklmnopqrstuvwxyz0123456789" "$TEMP_DIR/fail-run.out"; then
   fail "a GitHub token reached the job log"
 fi
@@ -315,21 +326,58 @@ fi
 if grep -q "$(printf '\033')" "$TEMP_DIR/fail-run.out"; then
   fail "terminal escape sequences reached the job log"
 fi
+sed -n 's/^  copilot stderr | //p' "$TEMP_DIR/fail-run.out" > "$TEMP_DIR/stderr-content.txt"
+[ -s "$TEMP_DIR/stderr-content.txt" ] || fail "no CLI stderr was printed"
+if LC_ALL=C grep -q "[^A-Za-z0-9 .,_'\"/=?-]" "$TEMP_DIR/stderr-content.txt"; then
+  fail "a character outside the allowlist reached the job log"
+fi
 
-# The runner would process no command from that output...
+# The runner would act on nothing in that output: no workflow command, and no
+# problem-matcher annotation.
 commands=$(node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/fail-run.out")
 [ -z "$commands" ] || fail "the runner would process workflow commands from CLI stderr: $commands"
-# ...while the same stderr printed raw carries live commands of both forms,
-# and with only a line prefix it still carries the legacy ones.
+matches=$(node "$ROOT/tests/problem-matchers.mjs" "$TEMP_DIR/fail-run.out")
+[ -z "$matches" ] || fail "setup-node's problem matchers would annotate CLI stderr: $matches"
+
+# Controls. Printed raw, the same stderr carries live commands of both forms
+# and both cases, and all three matcher shapes. With only the line prefix the
+# legacy form stays live; with the fence as well, commands stop but the
+# eslint-compact line still matches, which is why the stderr is sanitized.
 "$failing_bin/copilot" 2> "$TEMP_DIR/raw-stderr.txt" || true
 node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/raw-stderr.txt" > "$TEMP_DIR/raw-commands.txt"
-for command_name in add-mask error set-env; do
+for command_name in add-mask error set-env warning; do
   assert_contains "$TEMP_DIR/raw-commands.txt" ": $command_name"
+done
+[ "$(grep -c ': add-mask' "$TEMP_DIR/raw-commands.txt")" = "3" ] \
+  || fail "expected three live add-mask commands in the raw stderr"
+node "$ROOT/tests/problem-matchers.mjs" "$TEMP_DIR/raw-stderr.txt" > "$TEMP_DIR/raw-matches.txt"
+for matcher_owner in eslint-compact tsc eslint-stylish; do
+  assert_contains "$TEMP_DIR/raw-matches.txt" ": $matcher_owner"
 done
 sed 's/^/  copilot stderr | /' "$TEMP_DIR/raw-stderr.txt" > "$TEMP_DIR/prefixed-stderr.txt"
 node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/prefixed-stderr.txt" \
   > "$TEMP_DIR/prefixed-commands.txt"
 assert_contains "$TEMP_DIR/prefixed-commands.txt" ": error"
+fence_token=0123456789abcdef0123456789abcdef
+{
+  printf '::stop-commands::%s\n' "$fence_token"
+  cat "$TEMP_DIR/prefixed-stderr.txt"
+  printf '::%s::\n' "$fence_token"
+} > "$TEMP_DIR/fenced-stderr.txt"
+[ -z "$(node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/fenced-stderr.txt")" ] \
+  || fail "the fence should stop every command"
+node "$ROOT/tests/problem-matchers.mjs" "$TEMP_DIR/fenced-stderr.txt" > "$TEMP_DIR/fenced-matches.txt"
+assert_contains "$TEMP_DIR/fenced-matches.txt" ": eslint-compact"
+
+# The command emulator itself follows the runner: names, stop-commands and the
+# resume token compare case-insensitively, and CR, LF and CRLF each end a line.
+printf '%s\r%s\n%s\r\n%s\n%s\n%s\n%s\n%s\n' 'plain text' '::ADD-MASK::after a CR' \
+  'quoted ##[ERROR]upper case' '::STOP-COMMANDS::AbC123' '::add-mask::while stopped' \
+  '##[error]while stopped' '::abc123::' '::warning::after the resume' \
+  > "$TEMP_DIR/emulator-cases.txt"
+emulated=$(node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/emulator-cases.txt")
+[ "$emulated" = "$(printf '%s\n' 'line 2: add-mask' 'line 3: error' 'line 8: warning')" ] \
+  || fail "the command emulator diverges from the runner: $emulated"
 
 # Each failed call gets its own random 32-hex stop token, resumed once the
 # stderr is printed, and every line in between carries the prefix.

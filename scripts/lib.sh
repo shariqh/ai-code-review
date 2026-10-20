@@ -85,13 +85,18 @@ redact_secrets() {
 # CLI_STDERR_MAX_BYTES bytes and CLI_STDERR_MAX_LINES lines, terminal control
 # sequences removed, secrets redacted.
 #
-# The stderr can quote the untrusted diff, so it must not reach the runner's
-# workflow-command parser. A line prefix only stops `::command::`, which has
-# to start the line; the legacy `##[command]` form is recognised anywhere in
-# a line. So the text is printed inside a ::stop-commands:: block whose
-# resume token is random for every call and generated after the CLI exited:
-# the runner processes no command in between, and the stderr cannot end the
-# block early. The prefix stays, so no line renders as runner output either.
+# The stderr can quote the untrusted diff, and the runner acts on two kinds of
+# log line: workflow commands (`::command::` at the start of a line, and the
+# legacy `##[command]` anywhere in one) and problem matchers (setup-node
+# registers eslint-compact, eslint-stylish and tsc, whose patterns need a
+# colon, brackets or parentheses, and which run even on lines a stop-commands
+# block shields from the command parser). So every character outside a small
+# allowlist (letters, digits, space and . , _ - ' " / =) becomes "?", which
+# leaves the error readable but gives neither the command parser nor those
+# matchers anything to match.
+# As defence in depth the text is also printed inside a ::stop-commands::
+# block whose resume token is random for every call and generated after the
+# CLI exited, and every line carries a prefix.
 print_cli_stderr() {
   local file=${1:?stderr file is required}
   local max_bytes=${CLI_STDERR_MAX_BYTES:-4000}
@@ -128,9 +133,12 @@ print_cli_stderr() {
     text=${text//"$token"/[REDACTED]}
   fi
 
+  # tr maps byte for byte (LC_ALL=C, so a multibyte character becomes one "?"
+  # per byte), which keeps the byte and line bounds above intact.
   printf '::stop-commands::%s\n' "$stop_token"
   printf '%s\n' "$text" \
     | redact_secrets \
+    | LC_ALL=C tr -c "A-Za-z0-9 .,_'\"/=\n-" '?' \
     | head -n "$max_lines" \
     | cut -c1-400 \
     | sed "s/^/$prefix/" \

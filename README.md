@@ -206,13 +206,14 @@ be present.
 ## When a review call fails
 
 A failed model call is listed in the sticky comment's **Incomplete review**
-note, and the Copilot CLI's error output is printed in the job log under the
-review step, at most 4,000 bytes and 40 lines, with token-like strings
-redacted and punctuation outside a small allowlist shown as `?`. A call that
-exits successfully with an empty reply counts as failed too, since it
-reviewed nothing. If every call failed, the job fails after posting the
-comment, so nothing reports success over a review that never happened; a
-partial failure is a warning.
+note, and the end of the Copilot CLI's error output is printed in the job log
+under the review step: the last 10 lines and at most 1,000 bytes, which is
+where a failure names its cause. Credentials are redacted from the whole
+output before it is cut, and punctuation outside a small allowlist is shown
+as `?`. A call that exits successfully with an empty reply counts as failed
+too, since it reviewed nothing. If every call failed, the job fails after
+posting the comment, so nothing reports success over a review that never
+happened; a partial failure is a warning.
 
 A model that the Copilot seat no longer offers fails every call within
 seconds with `Error: Model "<id>" from --model flag is not available.`,
@@ -261,15 +262,22 @@ truncated with a note.
 - Built-in MCP servers and remote session export are disabled.
 - `COPILOT_GITHUB_TOKEN` is marked as a secret environment variable so it is
   removed from tool environments and redacted from output. CLI error output
-  printed after a failed call is also stripped of token-like strings. Because
-  it can quote the diff, every character outside a small allowlist (letters,
-  digits, space and `. , _ - ' " /` `=`) becomes `?`, so no colon, `#`,
-  bracket or parenthesis survives. That leaves nothing for the runner's
-  workflow commands (`::command::`, or the legacy `##[command]` anywhere in a
-  line) or for the problem matchers setup-node registers (eslint-compact,
-  eslint-stylish, tsc) to act on. As defence in depth it is printed inside a
-  `::stop-commands::` block with a random per-call resume token, which stops
-  commands but not matchers, and each line carries a prefix.
+  printed after a failed call goes through `scripts/sanitize-stderr.mjs`,
+  which first strips terminal control sequences, then redacts credentials in
+  the whole output, case-insensitively: the token value, Authorization,
+  Cookie and X-Api-Key header values, Basic and Bearer credentials, values
+  labelled as a token, password, secret or API key, and GitHub, JWT and
+  Copilot session token shapes. Only then does it keep the last 10 lines and
+  1,000 bytes, so the cut cannot leave a fragment of a credential behind.
+  Because the output can quote the diff, every character outside a small
+  allowlist (letters, digits, space and `. , _ - ' " /` `=`) becomes `?`, so
+  no colon, `#`, bracket or parenthesis survives. That leaves nothing for the
+  runner's workflow commands (`::command::`, or the legacy `##[command]`
+  anywhere in a line) or for the problem matchers setup-node registers
+  (eslint-compact, eslint-stylish, tsc) to act on. As defence in depth it is
+  printed inside a `::stop-commands::` block with a random per-call resume
+  token, which stops commands but not matchers, and each line carries a
+  prefix.
 - The reusable workflow checks out this repository at its own pinned commit
   without persisting credentials, and requests only `contents: read` and
   `pull-requests: write`.

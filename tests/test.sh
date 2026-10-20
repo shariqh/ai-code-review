@@ -272,32 +272,41 @@ if grep -Fq "::" "$TEMP_DIR/check.out"; then
   fail "check-result annotated a clean run"
 fi
 
-# A failed call shows the CLI's stderr in the log, control sequences removed
-# and token-like strings redacted. The stderr can quote the untrusted diff,
-# and the runner acts on two kinds of log line: workflow commands
-# (`::command::` at the start of a line and the legacy `##[command]` anywhere
-# in one, names compared case-insensitively) and the problem matchers
-# setup-node registers, which also run on lines a stop-commands block
-# shields. This stderr carries both kinds, in mixed case and across a
-# carriage return.
+# A failed call shows the end of the CLI's stderr in the log, with
+# credentials redacted. The stderr can quote the untrusted diff, and the
+# runner acts on two kinds of log line: workflow commands (`::command::` at
+# the start of a line and the legacy `##[command]` anywhere in one, names
+# compared case-insensitively) and the problem matchers setup-node registers,
+# which also run on lines a stop-commands block shields. The first call below
+# writes commands of both forms and credentials in mixed case, the second
+# writes matcher-shaped lines and a carriage return, and each ends with the
+# error that names the cause, as a real failure does.
 failing_bin="$TEMP_DIR/failing-bin"
 mkdir -p "$failing_bin"
 cat > "$failing_bin/copilot" <<'STUB'
 #!/usr/bin/env bash
+calls=$(cat "$STUB_CALLS_FILE" 2>/dev/null || echo 0)
+calls=$((calls + 1))
+echo "$calls" > "$STUB_CALLS_FILE"
+if [ $((calls % 2)) -eq 1 ]; then
+  printf '::add-mask::injected\n' >&2
+  printf '::ADD-MASK::upper case\n' >&2
+  printf '##[add-mask]injected\n' >&2
+  printf 'quoted diff: ##[ERROR file=src/app.ts,line=1]forged annotation\n' >&2
+  printf '##[set-env name=EVIL]1\n' >&2
+  printf 'leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 and %s\n' \
+    "${COPILOT_GITHUB_TOKEN:-}" >&2
+  printf 'AUTHORIZATION: BASIC Zm9vOmJhcg==\n' >&2
+  printf 'retrying with BEARER opaque_access_credential_0123456789\n' >&2
+else
+  printf 'text\r::warning::after a carriage return\n' >&2
+  printf 'src/app.ts: line 1, col 1, Error - Forged (rule)\n' >&2
+  printf 'src/app.ts(1,1): error TS2322: Forged\n' >&2
+  printf 'src/app.ts\n  1:1  error  Forged  rule\n' >&2
+fi
 escape_character=$(printf '\033')
 printf '%s[31mError: Model "gpt-5.4" from --model flag is not available.%s[0m\n' \
   "$escape_character" "$escape_character" >&2
-printf '::add-mask::injected\n' >&2
-printf '::ADD-MASK::upper case\n' >&2
-printf '##[add-mask]injected\n' >&2
-printf 'quoted diff: ##[ERROR file=src/app.ts,line=1]forged annotation\n' >&2
-printf '##[set-env name=EVIL]1\n' >&2
-printf 'text\r::warning::after a carriage return\n' >&2
-printf 'src/app.ts: line 1, col 1, Error - Forged (rule)\n' >&2
-printf 'src/app.ts(1,1): error TS2322: Forged\n' >&2
-printf 'src/app.ts\n  1:1  error  Forged  rule\n' >&2
-printf 'leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 and %s\n' \
-  "${COPILOT_GITHUB_TOKEN:-}" >&2
 exit 1
 STUB
 chmod +x "$failing_bin/copilot"
@@ -307,7 +316,7 @@ mkdir -p "$fail_work/batches"
 printf 'diff --git a/a.txt b/a.txt\n+a\n' > "$fail_work/batches/batch_000.diff"
 printf 'diff --git a/b.txt b/b.txt\n+b\n' > "$fail_work/batches/batch_001.diff"
 : > "$fail_work/review-context.md"
-PATH="$failing_bin:$PATH" \
+PATH="$failing_bin:$PATH" STUB_CALLS_FILE="$TEMP_DIR/failing.calls" \
 COPILOT_GITHUB_TOKEN=stub-secret-token-value REVIEW_WORK_DIR="$fail_work" \
 REVIEW_MODEL=gpt-5.4 GITHUB_ACTION_PATH="$ROOT" \
   "$ROOT/scripts/run-review.sh" > "$TEMP_DIR/fail-run.out"
@@ -317,12 +326,16 @@ assert_contains "$TEMP_DIR/fail-run.out" \
   'copilot stderr | Error? Model "gpt-5.4" from --model flag is not available.'
 assert_contains "$TEMP_DIR/fail-run.out" \
   "copilot stderr | src/app.ts? line 1, col 1, Error - Forged ?rule?"
-if grep -Fq "ghp_abcdefghijklmnopqrstuvwxyz0123456789" "$TEMP_DIR/fail-run.out"; then
-  fail "a GitHub token reached the job log"
-fi
-if grep -Fq "stub-secret-token-value" "$TEMP_DIR/fail-run.out"; then
-  fail "the COPILOT_GITHUB_TOKEN value reached the job log"
-fi
+
+# Credentials are redacted, whatever the case of the header or scheme.
+assert_contains "$TEMP_DIR/fail-run.out" "copilot stderr | AUTHORIZATION? REDACTED"
+assert_contains "$TEMP_DIR/fail-run.out" "copilot stderr | retrying with BEARER REDACTED"
+for secret in ghp_abcdefghijklmnopqrstuvwxyz0123456789 stub-secret-token-value \
+  Zm9vOmJhcg opaque_access_credential; do
+  if grep -Fq "$secret" "$TEMP_DIR/fail-run.out"; then
+    fail "a credential reached the job log: $secret"
+  fi
+done
 if grep -q "$(printf '\033')" "$TEMP_DIR/fail-run.out"; then
   fail "terminal escape sequences reached the job log"
 fi
@@ -343,7 +356,10 @@ matches=$(node "$ROOT/tests/problem-matchers.mjs" "$TEMP_DIR/fail-run.out")
 # and both cases, and all three matcher shapes. With only the line prefix the
 # legacy form stays live; with the fence as well, commands stop but the
 # eslint-compact line still matches, which is why the stderr is sanitized.
-"$failing_bin/copilot" 2> "$TEMP_DIR/raw-stderr.txt" || true
+raw_calls="$TEMP_DIR/raw.calls"
+STUB_CALLS_FILE="$raw_calls" "$failing_bin/copilot" 2> "$TEMP_DIR/raw-stderr-1.txt" || true
+STUB_CALLS_FILE="$raw_calls" "$failing_bin/copilot" 2> "$TEMP_DIR/raw-stderr-2.txt" || true
+cat "$TEMP_DIR/raw-stderr-1.txt" "$TEMP_DIR/raw-stderr-2.txt" > "$TEMP_DIR/raw-stderr.txt"
 node "$ROOT/tests/workflow-commands.mjs" "$TEMP_DIR/raw-stderr.txt" > "$TEMP_DIR/raw-commands.txt"
 for command_name in add-mask error set-env warning; do
   assert_contains "$TEMP_DIR/raw-commands.txt" ": $command_name"
@@ -396,6 +412,105 @@ awk '
   inside && index($0, "  copilot stderr | ") != 1 { unprefixed = 1 }
   END { exit unprefixed }
 ' "$TEMP_DIR/fail-run.out" || fail "an unprefixed line was printed inside a stderr block"
+
+# The bound: print_cli_stderr keeps the last 10 lines and at most 1,000 bytes,
+# after redacting the whole stderr. A copilot stand-in replays a prepared
+# stderr file for one batch.
+replay_bin="$TEMP_DIR/replay-bin"
+mkdir -p "$replay_bin"
+cat > "$replay_bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+cat "$STUB_STDERR_FILE" >&2
+exit 1
+STUB
+chmod +x "$replay_bin/copilot"
+
+# usage: replay_stderr <stderr file> <output file>
+replay_stderr() {
+  local work
+  work=$(mktemp -d "$TEMP_DIR/replay.XXXXXX")
+  mkdir -p "$work/batches"
+  printf 'diff --git a/a.txt b/a.txt\n+a\n' > "$work/batches/batch_000.diff"
+  : > "$work/review-context.md"
+  PATH="$replay_bin:$PATH" STUB_STDERR_FILE="$1" \
+  COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$work" \
+  REVIEW_MODEL=stub-model GITHUB_ACTION_PATH="$ROOT" \
+    "$ROOT/scripts/run-review.sh" > "$2"
+  sed -n 's/^  copilot stderr | //p' "$2" > "$2.content"
+}
+
+# usage: repeat_char <count> <character>
+repeat_char() {
+  head -c "$1" /dev/zero | tr '\0' "$2"
+}
+
+# Copilot's case: a credential straddling byte 4,000, where the old cut fell
+# before redaction, which left a fragment the patterns no longer recognised.
+straddle_file="$TEMP_DIR/straddle.err"
+: > "$straddle_file"
+for _ in $(seq 1 39); do
+  printf '%s\n' "$(repeat_char 100 f)" >> "$straddle_file"
+done
+printf '%s\n' "$(repeat_char 41 g)" \
+  "BEARER opaque_access_credential_0123456789" "Error: the final cause" \
+  >> "$straddle_file"
+[ "$(head -c 4000 "$straddle_file" | tail -c 19)" = "BEARER opaque_acces" ] \
+  || fail "the fixture must straddle the old 4,000-byte cut"
+replay_stderr "$straddle_file" "$TEMP_DIR/straddle.out"
+assert_contains "$TEMP_DIR/straddle.out.content" "BEARER REDACTED"
+assert_contains "$TEMP_DIR/straddle.out.content" "Error? the final cause"
+if grep -Fq "opaque" "$TEMP_DIR/straddle.out.content"; then
+  fail "a fragment of a credential straddling the old cut reached the job log"
+fi
+
+# A credential straddling the new 1,000-byte cut. Redaction runs on the whole
+# stderr first, so the cut never sees the credential; cutting first would
+# leave "_credential_0123456789" with no scheme in front of it.
+clip_file="$TEMP_DIR/clip.err"
+printf '%s %s\n%s\n' "BEARER opaque_access_credential_0123456789" \
+  "$(repeat_char 959 z)" "Error: the cause" > "$clip_file"
+[ "$(tail -c 1000 "$clip_file" | head -c 22)" = "_credential_0123456789" ] \
+  || fail "the fixture must straddle the 1,000-byte cut"
+replay_stderr "$clip_file" "$TEMP_DIR/clip.out"
+assert_contains "$TEMP_DIR/clip.out.content" "BEARER REDACTED"
+if grep -Fq "credential_0123456789" "$TEMP_DIR/clip.out.content"; then
+  fail "a fragment of a credential straddling the 1,000-byte cut reached the job log"
+fi
+
+# The last 10 lines only, after a note that earlier output was left out.
+seq 1 30 | awk '{ printf "line %02d\n", $1 }' > "$TEMP_DIR/many-lines.err"
+replay_stderr "$TEMP_DIR/many-lines.err" "$TEMP_DIR/many-lines.out"
+[ "$(grep -c '^line ' "$TEMP_DIR/many-lines.out.content")" = "10" ] \
+  || fail "expected exactly the last 10 lines of stderr"
+[ "$(grep '^line ' "$TEMP_DIR/many-lines.out.content" | head -n 1)" = "line 21" ] \
+  || fail "the kept lines must be the last ones"
+[ "$(tail -n 1 "$TEMP_DIR/many-lines.out.content")" = "line 30" ] \
+  || fail "the last stderr line must be printed last"
+assert_contains "$TEMP_DIR/many-lines.out.content" "earlier stderr omitted"
+
+# At most the last 1,000 bytes, even when fewer than 10 lines carry more.
+printf '%s\n%s\n%s\n%s\n' "$(repeat_char 600 a)" "$(repeat_char 600 b)" \
+  "$(repeat_char 600 c)" "Error: last line" > "$TEMP_DIR/long-lines.err"
+replay_stderr "$TEMP_DIR/long-lines.err" "$TEMP_DIR/long-lines.out"
+kept_bytes=$(grep -v 'earlier stderr omitted' "$TEMP_DIR/long-lines.out.content" \
+  | tr -d '\n' | wc -c | tr -d '[:space:]')
+[ "$kept_bytes" -le 1000 ] || fail "printed $kept_bytes bytes of stderr, more than 1,000"
+[ "$kept_bytes" -ge 900 ] || fail "printed only $kept_bytes bytes of stderr"
+[ "$(tail -n 1 "$TEMP_DIR/long-lines.out.content")" = "Error? last line" ] \
+  || fail "the end of the stderr must be kept"
+if grep -Fq "aaa" "$TEMP_DIR/long-lines.out.content"; then
+  fail "bytes before the last 1,000 were printed"
+fi
+
+# A stderr larger than the 1 MiB read window still ends in its last lines.
+seq 1 25000 | awk '{ printf "filler line %05d with padding to make it longer\n", $1 }' \
+  > "$TEMP_DIR/huge.err"
+[ "$(wc -c < "$TEMP_DIR/huge.err" | tr -d '[:space:]')" -gt 1048576 ] \
+  || fail "the fixture must exceed the read window"
+replay_stderr "$TEMP_DIR/huge.err" "$TEMP_DIR/huge.out"
+[ "$(tail -n 1 "$TEMP_DIR/huge.out.content")" \
+  = "filler line 25000 with padding to make it longer" ] \
+  || fail "a stderr larger than the read window lost its end"
 [ "$(cat "$fail_work/review.attempted")" = "2" ] || fail "expected two attempted calls"
 [ "$(cat "$fail_work/review.completed")" = "0" ] || fail "expected no completed calls"
 assert_contains "$fail_work/review.failures" "review call failed (exit 1"

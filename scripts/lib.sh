@@ -68,86 +68,42 @@ sticky_header_fields() {
   '
 }
 
-# Replace anything token-like on stdin: GitHub token formats, JWTs, and the
-# values of Authorization headers and bearer/token pairs. The CLI already
-# redacts COPILOT_GITHUB_TOKEN and Actions masks registered secrets; this
-# covers credentials neither of them knows about.
-redact_secrets() {
-  sed -E \
-    -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[REDACTED]/g' \
-    -e 's/eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*)?/[REDACTED]/g' \
-    -e 's/([Aa]uthorization["'\'']?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+([[:space:]]+[^[:space:],;"'\'']+)?/\1[REDACTED]/g' \
-    -e 's/([Bb]earer|[Tt]oken)([[:space:]]+|[[:space:]]*[:=][[:space:]]*)[A-Za-z0-9._~+\/=-]{20,}/\1\2[REDACTED]/g' \
-    -e 's/(tid=)[^[:space:]]+/\1[REDACTED]/g'
-}
-
-# Print a failed Copilot CLI call's stderr into the job log: at most
-# CLI_STDERR_MAX_BYTES bytes and CLI_STDERR_MAX_LINES lines, terminal control
-# sequences removed, secrets redacted.
+# Print a failed Copilot CLI call's stderr into the job log.
 #
-# The stderr can quote the untrusted diff, and the runner acts on two kinds of
-# log line: workflow commands (`::command::` at the start of a line, and the
-# legacy `##[command]` anywhere in one) and problem matchers (setup-node
-# registers eslint-compact, eslint-stylish and tsc, whose patterns need a
-# colon, brackets or parentheses, and which run even on lines a stop-commands
-# block shields from the command parser). So every character outside a small
-# allowlist (letters, digits, space and . , _ - ' " / =) becomes "?", which
-# leaves the error readable but gives neither the command parser nor those
-# matchers anything to match.
-# As defence in depth the text is also printed inside a ::stop-commands::
-# block whose resume token is random for every call and generated after the
-# CLI exited, and every line carries a prefix.
+# sanitize-stderr.mjs does the text work, in this order: strip terminal
+# control sequences, redact credentials in the WHOLE stderr
+# (case-insensitively), keep only the last 10 lines and at most 1,000 bytes,
+# then replace every character outside a small allowlist with "?" and prefix
+# each line. Redacting before cutting means the cut can never leave a
+# fragment of a credential, and the allowlist (no colon, "#", brackets or
+# parentheses) leaves nothing for workflow commands or for setup-node's
+# problem matchers to act on, though the stderr can quote the untrusted diff.
+#
+# As defence in depth this wraps that output in a ::stop-commands:: block
+# whose resume token is random for every call and generated after the CLI
+# exited. The fence stops workflow commands, but not problem matchers, which
+# is why the allowlist is the primary defence. The fence is printed here
+# rather than by the script, so it is closed even if the script fails.
 print_cli_stderr() {
   local file=${1:?stderr file is required}
-  local max_bytes=${CLI_STDERR_MAX_BYTES:-4000}
-  local max_lines=${CLI_STDERR_MAX_LINES:-40}
   local prefix='  copilot stderr | '
-  local token=${COPILOT_GITHUB_TOKEN-}
   local stop_token
-  local escape_character
-  local text
-  local total_bytes
-  local total_lines
 
   if [ ! -s "$file" ]; then
-    printf '%s%s\n' "$prefix" "(the Copilot CLI wrote nothing to stderr)"
+    printf '%s%s\n' "$prefix" "the Copilot CLI wrote nothing to stderr"
     return 0
   fi
 
   stop_token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || stop_token=""
   if ! [[ "$stop_token" =~ ^[0-9a-f]{32}$ ]]; then
-    printf '%s%s\n' "$prefix" "(stderr withheld: no random token to fence it from workflow commands)"
+    printf '%s%s\n' "$prefix" "stderr withheld, no random token to fence it from workflow commands"
     return 0
   fi
 
-  # CSI sequences (ESC [ parameters intermediates final) first, then every
-  # remaining control byte except tab and newline, so a carriage return
-  # cannot overwrite a line in the rendered log. This runs inside the batch
-  # loop, so a failure here must not end the review.
-  escape_character=$(printf '\033')
-  text=$(head -c "$max_bytes" "$file" \
-    | LC_ALL=C sed "s#${escape_character}\\[[0-9;?]*[ -/]*[@-~]##g" \
-    | LC_ALL=C tr -d '\000-\010\013-\037\177') \
-    || text="(the Copilot CLI's stderr could not be read)"
-  if [ "${#token}" -ge 8 ]; then
-    text=${text//"$token"/[REDACTED]}
-  fi
-
-  # tr maps byte for byte (LC_ALL=C, so a multibyte character becomes one "?"
-  # per byte), which keeps the byte and line bounds above intact.
+  # This runs inside the batch loop, so a failure here must not end the
+  # review.
   printf '::stop-commands::%s\n' "$stop_token"
-  printf '%s\n' "$text" \
-    | redact_secrets \
-    | LC_ALL=C tr -c "A-Za-z0-9 .,_'\"/=\n-" '?' \
-    | head -n "$max_lines" \
-    | cut -c1-400 \
-    | sed "s/^/$prefix/" \
-    || true
-
-  total_bytes=$(wc -c < "$file" | tr -d '[:space:]')
-  total_lines=$(printf '%s\n' "$text" | wc -l | tr -d '[:space:]')
-  if [ "$total_bytes" -gt "$max_bytes" ] || [ "$total_lines" -gt "$max_lines" ]; then
-    printf '%s[... stderr truncated; %s bytes in total ...]\n' "$prefix" "$total_bytes"
-  fi
+  node "$GITHUB_ACTION_PATH/scripts/sanitize-stderr.mjs" "$file" \
+    || printf '%s%s\n' "$prefix" "the Copilot CLI stderr could not be printed"
   printf '::%s::\n' "$stop_token"
 }

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 
+# A reply is clean when it says "No issues found." and nothing else. An empty
+# or whitespace-only reply is not clean: it reviewed nothing.
 is_clean_review() {
   local file=${1:?review file is required}
   local stripped
   local remainder
   stripped=$(tr -d '[:space:]' < "$file")
+  [ -n "$stripped" ] || return 1
   remainder=$stripped
 
   while [ "${remainder#Noissuesfound.}" != "$remainder" ]; do
@@ -19,6 +22,50 @@ is_complete_clean_review() {
   [ ! -s "$work_dir/overflow.note" ] \
     && [ ! -s "$work_dir/review.failures" ] \
     && [ "$(tr -d '[:space:]' < "$work_dir/review.md")" = "Noissuesfound." ]
+}
+
+# The jq filter that lists one reviewer's sticky comment ids: comments by
+# github-actions[bot] whose FIRST line is exactly that reviewer's marker. The
+# body carries model output, so a marker found anywhere else in it may be a
+# quotation (for example one reviewer quoting another's marker) and must not
+# make the comment that reviewer's sticky.
+sticky_ids_jq() {
+  local marker=${1:?marker is required}
+  printf '.[] | select((.user.login == "github-actions[bot]") and ((((.body // "") | split("\\n") | .[0]) | rtrimstr("\\r")) == "<!-- %s -->")) | .id' "$marker"
+}
+
+# Print the reviewed commit, run id and run attempt recorded in a sticky
+# comment's header as "<sha> <run> <attempt>", with "-" for anything missing.
+# The header is every line before the "ai-code-review-result" marker, which
+# post-comment.sh writes ahead of any model output, so a review that quotes
+# these lines cannot override them. A body without that marker has no header.
+sticky_header_fields() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<!-- ai-code-review-result: / { complete = 1; exit }
+    sha == "" && /^_Reviewed commit: `[0-9a-f]+`_$/ {
+      sha = $0
+      sub(/^_Reviewed commit: `/, "", sha)
+      sub(/`_$/, "", sha)
+    }
+    run == "" && /^<!-- ai-code-review-run: [0-9]+ -->$/ {
+      run = $0
+      sub(/^<!-- ai-code-review-run: /, "", run)
+      sub(/ -->$/, "", run)
+    }
+    attempt == "" && /^<!-- ai-code-review-attempt: [0-9]+ -->$/ {
+      attempt = $0
+      sub(/^<!-- ai-code-review-attempt: /, "", attempt)
+      sub(/ -->$/, "", attempt)
+    }
+    END {
+      if (!complete) { sha = ""; run = ""; attempt = "" }
+      if (sha == "") sha = "-"
+      if (run == "") run = "-"
+      if (attempt == "") attempt = "-"
+      printf "%s %s %s\n", sha, run, attempt
+    }
+  '
 }
 
 # Replace anything token-like on stdin: GitHub token formats, JWTs, and the
@@ -36,15 +83,22 @@ redact_secrets() {
 
 # Print a failed Copilot CLI call's stderr into the job log: at most
 # CLI_STDERR_MAX_BYTES bytes and CLI_STDERR_MAX_LINES lines, terminal control
-# sequences removed, secrets redacted. Every line is prefixed, so nothing the
-# CLI echoes back (it can quote the untrusted diff) can start a workflow
-# command such as ::add-mask:: or ::stop-commands::.
+# sequences removed, secrets redacted.
+#
+# The stderr can quote the untrusted diff, so it must not reach the runner's
+# workflow-command parser. A line prefix only stops `::command::`, which has
+# to start the line; the legacy `##[command]` form is recognised anywhere in
+# a line. So the text is printed inside a ::stop-commands:: block whose
+# resume token is random for every call and generated after the CLI exited:
+# the runner processes no command in between, and the stderr cannot end the
+# block early. The prefix stays, so no line renders as runner output either.
 print_cli_stderr() {
   local file=${1:?stderr file is required}
   local max_bytes=${CLI_STDERR_MAX_BYTES:-4000}
   local max_lines=${CLI_STDERR_MAX_LINES:-40}
   local prefix='  copilot stderr | '
   local token=${COPILOT_GITHUB_TOKEN-}
+  local stop_token
   local escape_character
   local text
   local total_bytes
@@ -52,6 +106,12 @@ print_cli_stderr() {
 
   if [ ! -s "$file" ]; then
     printf '%s%s\n' "$prefix" "(the Copilot CLI wrote nothing to stderr)"
+    return 0
+  fi
+
+  stop_token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || stop_token=""
+  if ! [[ "$stop_token" =~ ^[0-9a-f]{32}$ ]]; then
+    printf '%s%s\n' "$prefix" "(stderr withheld: no random token to fence it from workflow commands)"
     return 0
   fi
 
@@ -68,6 +128,7 @@ print_cli_stderr() {
     text=${text//"$token"/[REDACTED]}
   fi
 
+  printf '::stop-commands::%s\n' "$stop_token"
   printf '%s\n' "$text" \
     | redact_secrets \
     | head -n "$max_lines" \
@@ -80,4 +141,5 @@ print_cli_stderr() {
   if [ "$total_bytes" -gt "$max_bytes" ] || [ "$total_lines" -gt "$max_lines" ]; then
     printf '%s[... stderr truncated; %s bytes in total ...]\n' "$prefix" "$total_bytes"
   fi
+  printf '::%s::\n' "$stop_token"
 }

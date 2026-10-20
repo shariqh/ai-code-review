@@ -30,10 +30,11 @@ jobs:
         run: bash tests/test.sh
 
   # Call the reusable workflow the way a consumer does, once per runs-on form.
-  # No COPILOT_REVIEW_PAT is passed, so every reviewer job takes the action's
-  # missing-token skip: this checks the inputs, the reviewer matrix, runner
-  # parsing and the self-checkout without spending Copilot quota. The job
-  # permissions match what the reusable workflow requests.
+  # No COPILOT_REVIEW_PAT is passed and allow-missing-token is on, so every
+  # reviewer job takes the action's missing-token skip (without the opt-out a
+  # missing token fails the job): this checks the inputs, the reviewer matrix,
+  # runner parsing and the self-checkout without spending Copilot quota. The
+  # job permissions match what the reusable workflow requests.
   reusable-json-runner:
     name: reusable (JSON runs-on, default reviewers)
     permissions:
@@ -42,6 +43,7 @@ jobs:
     uses: ./.github/workflows/review.yml
     with:
       runs-on: '["ubuntu-latest"]'
+      allow-missing-token: true
 
   reusable-label-runner:
     name: reusable (label runs-on, one reviewer)
@@ -52,3 +54,4 @@ jobs:
     with:
       runs-on: ubuntu-latest
       reviewers: '[{"model": "gpt-5.6-sol", "marker": "ai-code-review-smoke"}]'
+      allow-missing-token: true

@@ -60,7 +60,15 @@ inputs:
   verify-landed:
     description: >-
       Fail the job unless the sticky comment now covers the pull request's
-      current head from this run. The reusable workflow turns this on.
+      current head from this run attempt. With this on, a missing
+      copilot-token also fails the job (see allow-missing-token). The
+      reusable workflow turns this on.
+    required: false
+    default: "false"
+  allow-missing-token:
+    description: >-
+      Skip with a warning instead of failing when copilot-token is empty and
+      verify-landed is on. For smoke tests that run without the secret.
     required: false
     default: "false"
 
@@ -84,6 +92,7 @@ runs:
         PR_DRAFT: ${{ github.event.pull_request.draft }}
         OWNER_ONLY: ${{ inputs.owner-only }}
         VERIFY_LANDED: ${{ inputs.verify-landed }}
+        ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
         REVIEW_MODEL: ${{ inputs.model }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
@@ -158,6 +167,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
         REVIEW_MODEL: ${{ inputs.model }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
@@ -179,6 +189,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
       run: "$GITHUB_ACTION_PATH/scripts/verify-landed.sh"
 

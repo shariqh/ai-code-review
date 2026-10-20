@@ -43,9 +43,16 @@ on:
       verify-landed:
         description: >-
           Fail a reviewer's job unless its sticky comment covers the pull
-          request's current head from this run
+          request's current head from this run attempt. With this on, a
+          missing COPILOT_REVIEW_PAT fails the job too.
         type: boolean
         default: true
+      allow-missing-token:
+        description: >-
+          Skip with a warning instead of failing when COPILOT_REVIEW_PAT is
+          absent. For smoke tests that run without the secret.
+        type: boolean
+        default: false
       copilot-cli-version:
         description: Exact @github/copilot package version
         type: string
@@ -88,7 +95,8 @@ on:
       COPILOT_REVIEW_PAT:
         description: >-
           Fine-grained PAT with the Copilot Requests permission. When it is
-          absent the review is skipped with a warning.
+          absent the job fails, unless verify-landed is off or
+          allow-missing-token is on, in which case it skips with a warning.
         required: false
 
 jobs:
@@ -155,3 +163,4 @@ jobs:
           owner-only: ${{ inputs.owner-only }}
           context-file: ${{ inputs.context-file }}
           verify-landed: ${{ inputs.verify-landed }}
+          allow-missing-token: ${{ inputs.allow-missing-token }}

@@ -89,7 +89,8 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `reviewers` | Sol and Astra (above) | Reviewer list |
 | `timeout-minutes` | `20` | Job timeout for reviewers without their own |
 | `cancel-in-progress` | `false` | Cancel a reviewer's running job when a newer push arrives |
-| `verify-landed` | `true` | Fail a job whose sticky comment does not cover the current head from this run |
+| `verify-landed` | `true` | Fail a job whose sticky comment does not cover the current head from this run attempt |
+| `allow-missing-token` | `false` | Skip with a warning instead of failing when `COPILOT_REVIEW_PAT` is absent |
 | `copilot-cli-version` | `1.0.74` | Exact CLI package version |
 | `node-version` | `lts/*` | Node.js version |
 | `reasoning-effort` | `high` | Model reasoning effort |
@@ -100,8 +101,10 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context (base branch only; empty disables) |
 
-The only secret is `COPILOT_REVIEW_PAT`. Without it the review is skipped with
-a warning.
+The only secret is `COPILOT_REVIEW_PAT`. Without it, a reviewer job on an
+eligible pull request fails, since `verify-landed` asks for a job that fails
+unless a review landed. Set `allow-missing-token` for a smoke test that runs
+without the secret; the job then skips with a warning.
 
 `cancel-in-progress` is off because a review takes longer than a fast push
 cycle: cancelling on every push can stop every review from finishing. With it
@@ -197,16 +200,18 @@ be present.
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context injected into the prompt (base ref only; empty disables) |
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
-| `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run |
+| `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
+| `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
 
 ## When a review call fails
 
 A failed model call is listed in the sticky comment's **Incomplete review**
 note, and the Copilot CLI's error output is printed in the job log under the
 review step, at most 4,000 bytes and 40 lines, with token-like strings
-redacted. If every call failed, the job fails after posting the comment, so
-nothing reports success over a review that never happened; a partial failure
-is a warning.
+redacted. A call that exits successfully with an empty reply counts as
+failed too, since it reviewed nothing. If every call failed, the job fails
+after posting the comment, so nothing reports success over a review that
+never happened; a partial failure is a warning.
 
 A model that the Copilot seat no longer offers fails every call within
 seconds with `Error: Model "<id>" from --model flag is not available.` (this
@@ -254,12 +259,21 @@ truncated with a note.
 - Built-in MCP servers and remote session export are disabled.
 - `COPILOT_GITHUB_TOKEN` is marked as a secret environment variable so it is
   removed from tool environments and redacted from output. CLI error output
-  printed after a failed call is also stripped of token-like strings and
-  prefixed line by line, so it cannot issue workflow commands.
+  printed after a failed call is also stripped of token-like strings, and
+  because it can quote the diff it is printed inside a `::stop-commands::`
+  block whose resume token is random for every call: the runner processes no
+  workflow command from it, neither `::command::` nor the legacy
+  `##[command]` form, which the runner recognises anywhere in a line. Each
+  line also carries a prefix.
 - The reusable workflow checks out this repository at its own pinned commit
   without persisting credentials, and requests only `contents: read` and
   `pull-requests: write`.
-- Only bot-authored comments containing this action's marker are updated.
+- A reviewer's sticky comment is the bot-authored comment whose first line is
+  exactly its marker. Only those are updated or deleted, so a review that
+  quotes another reviewer's marker cannot take over that reviewer's comment.
+- The reviewed commit, run id and run attempt are read only from the
+  comment's header, which ends before any model output, so quoted copies of
+  those lines further down are ignored.
 - The PR head is rechecked before the sticky comment changes.
 
 The review is advisory and is not a substitute for human review.

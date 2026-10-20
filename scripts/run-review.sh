@@ -101,7 +101,7 @@ PROMPT
     --no-remote-export \
     --silent \
     > batch.raw 2> batch.err; then
-    completed=$((completed + 1))
+    :
   else
     exit_code=$?
     # The CLI reports why it failed (a model the seat no longer offers, an
@@ -116,6 +116,18 @@ PROMPT
 
   escape_character=$(printf '\033')
   sed "s/${escape_character}\\[[0-9;]*m//g" batch.raw > batch.md
+
+  # A call that exits 0 with nothing to say reviewed nothing. Counting it as
+  # completed would read as "No issues found".
+  if [ -z "$(tr -d '[:space:]' < batch.md)" ]; then
+    echo "batch returned an empty reply; Copilot CLI stderr:"
+    print_cli_stderr batch.err
+    printf '%s\n' \
+      "- \`$batch\` - review call returned an empty reply; its files were NOT reviewed" \
+      >> review.failures
+    continue
+  fi
+  completed=$((completed + 1))
 
   if is_clean_review batch.md; then
     echo "no issues"

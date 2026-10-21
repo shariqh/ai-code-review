@@ -91,6 +91,14 @@ on:
           branch only. An empty string disables it.
         type: string
         default: .github/ai-review-context.md
+      review-scope:
+        description: >-
+          full reviews the whole pull request on every run. since-last-review
+          reviews it in full once, then each reviewer reviews only the commits
+          since the head it last reviewed completely, falling back to a full
+          review when that head cannot be trusted.
+        type: string
+        default: full
     secrets:
       COPILOT_REVIEW_PAT:
         description: >-
@@ -162,5 +170,6 @@ jobs:
           max-batches: ${{ inputs.max-batches }}
           owner-only: ${{ inputs.owner-only }}
           context-file: ${{ inputs.context-file }}
+          review-scope: ${{ inputs.review-scope }}
           verify-landed: ${{ inputs.verify-landed }}
           allow-missing-token: ${{ inputs.allow-missing-token }}

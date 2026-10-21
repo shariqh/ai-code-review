@@ -201,6 +201,10 @@ if [ "$findings" -eq 0 ]; then
     else
       printf '%s\n' "_Nothing new to review: the files this pull request changes are the same as at \`$since\`, so the findings of the review of that commit still apply. This comment's edit history has them._" > review.md
     fi
+  elif [ "$previous_result" = findings ]; then
+    # Only the commits since the last review were checked, so its findings
+    # still stand, and post-comment.sh keeps the result findings.
+    printf '%s\n' "_No new issues in the commits since \`$since\`, but the findings of the review of that commit were not re-checked and still stand. This comment's edit history has them._" > review.md
   else
     echo "No issues found." > review.md
   fi

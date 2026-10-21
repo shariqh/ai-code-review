@@ -84,10 +84,11 @@ sticky_header_fields() {
   '
 }
 
-# Print the result, full-review commit and coverage recorded in a sticky
-# comment's header as "<result> <full-review> <coverage>", with "-" for
+# Print the result, full-review commit, coverage, base branch and merge base
+# recorded in a sticky comment's header as
+# "<result> <full-review> <coverage> <base branch> <merge base>", with "-" for
 # anything missing. The result comes from the result marker that ends the
-# header; post-comment.sh writes the other two lines only for review-scope
+# header; post-comment.sh writes the other lines only for review-scope
 # since-last-review. Like sticky_header_fields, it reads the header only.
 sticky_scope_fields() {
   awk '
@@ -111,12 +112,18 @@ sticky_scope_fields() {
       sub(/^<!-- ai-code-review-coverage: /, "", coverage)
       sub(/ -->$/, "", coverage)
     }
+    base == "" && $0 ~ "^<!-- ai-code-review-base: [A-Za-z0-9][A-Za-z0-9._/-]* [0-9a-f]+ -->$" {
+      base = $0
+      sub(/^<!-- ai-code-review-base: /, "", base)
+      sub(/ -->$/, "", base)
+    }
     END {
-      if (!complete) { result = ""; full = ""; coverage = "" }
+      if (!complete) { result = ""; full = ""; coverage = ""; base = "" }
       if (result == "") result = "-"
       if (full == "") full = "-"
       if (coverage == "") coverage = "-"
-      printf "%s %s %s\n", result, full, coverage
+      if (base == "") base = "- -"
+      printf "%s %s %s %s\n", result, full, coverage, base
     }
   '
 }

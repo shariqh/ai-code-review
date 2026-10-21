@@ -276,6 +276,10 @@ when:
   partial;
 - the last reviewed head is not an ancestor of the new head, as after a
   force-push or rebase, or the checkout lacks it and fetching it fails;
+- the base changed since the last review: the pull request was retargeted to
+  another branch, or its base branch was rewound or rewritten, which can make
+  commits that review took for the base's own part of the pull request (a
+  base that only moved forward is fine);
 - the incremental diff cannot be built, for example because the base and the
   head share no history.
 
@@ -292,11 +296,19 @@ same head, no model is called: the comment says there was nothing new to
 review and keeps the last review's result.
 
 Under `since-last-review` the comment's header also records, for the next
-run, the full review's commit (`<!-- ai-code-review-full-review: <sha> -->`)
+run, the full review's commit (`<!-- ai-code-review-full-review: <sha> -->`),
+the base branch and merge base the review was diffed against
+(`<!-- ai-code-review-base: <branch> <sha> -->`, written only for a branch
+name of letters, digits and `. _ / -`, so any other name means full reviews),
 and whether the review covered everything
-(`<!-- ai-code-review-coverage: complete -->` or `incomplete`). The
-`ai-code-review-result` marker covers what was reviewed, so on an incremental
-review `clean` means the commits since the last review raised nothing.
+(`<!-- ai-code-review-coverage: complete -->` or `incomplete`).
+
+An incremental review re-checks only the commits since the last review, so
+findings from before stand until a full review. After a review with findings,
+the `ai-code-review-result` marker stays `findings` even when the new commits
+raise nothing, and the comment says that the earlier findings were not
+re-checked. On an incremental review `clean` therefore means that the review
+it builds on was clean and the commits since raised nothing.
 
 To review a pull request in full again, run with `review-scope: full`. That
 comment records no scope, so the next `since-last-review` run is a full
@@ -354,13 +366,18 @@ review too, and later runs build on it.
 - With `review-scope: since-last-review`, the previous head comes from the
   same header of the reviewer's own sticky, read with the same `github-token`
   that posts it. It is used only if it is a full 40-hex commit SHA from a
-  complete review and an ancestor of the PR head, every value is checked
-  against a strict pattern before it reaches git or the prompt, and no comment
-  text reaches a shell command. Besides reading the PR's comments, the only
-  added network access is one
+  complete review, the base branch is the same one and has not been rewound
+  past the recorded merge base, and the SHA is an ancestor of the PR head.
+  Every value is checked against a strict pattern before it reaches git or
+  the prompt, and no comment text reaches a shell command. Besides reading the
+  PR's comments, the only added network access is one
   `git fetch --no-tags --no-recurse-submodules origin <sha>`, without
   credentials, when the checkout lacks that commit. The PR's file names, which
-  the prompt lists, are marked as untrusted data like the diff.
+  the prompt lists, are marked as untrusted data like the diff. It trusts
+  anyone with write access to the repository, who can edit the bot's sticky
+  or post one as `github-actions[bot]` and so narrow the next review, just as
+  they can already read the workflow's secrets; later hardening is tracked in
+  [#7](https://github.com/shariqh/ai-code-review/issues/7).
 - The PR head is rechecked before the sticky comment changes.
 
 The review is advisory and is not a substitute for human review.

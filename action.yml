@@ -170,6 +170,8 @@ runs:
         LAST_REVIEWED_SHA: ${{ steps.last-review.outputs.reviewed-commit }}
         LAST_FULL_REVIEW_SHA: ${{ steps.last-review.outputs.full-review }}
         LAST_REVIEW_RESULT: ${{ steps.last-review.outputs.result }}
+        LAST_BASE_REF: ${{ steps.last-review.outputs.base-ref }}
+        LAST_MERGE_BASE: ${{ steps.last-review.outputs.merge-base }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
 
     - name: Run adversarial review

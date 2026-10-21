@@ -904,7 +904,8 @@ chmod +x "$finding_bin/copilot" "$down_bin/copilot"
 
 # Runs prepare-review.sh with review-scope since-last-review into <work dir>,
 # logging to <work dir>.log. By default the last review is a complete, clean
-# one of head1; later NAME=value arguments override that or anything else.
+# one of head1 against main; later NAME=value arguments override that or
+# anything else.
 # usage: prepare_since <work dir> <head> [NAME=value]...
 prepare_since() {
   local work=$1 head=$2
@@ -913,6 +914,7 @@ prepare_since() {
     REVIEW_REPO_DIR="$scope_repo" REVIEW_WORK_DIR="$work" GITHUB_ACTION_PATH="$ROOT" \
     CONTEXT_FILE=.github/ai-review-context.md REVIEW_SCOPE=since-last-review \
     LAST_REVIEWED_SHA="$head1" LAST_FULL_REVIEW_SHA="$head1" LAST_REVIEW_RESULT=clean \
+    LAST_BASE_REF=main LAST_MERGE_BASE="$scope_base" \
     "$@" "$ROOT/scripts/prepare-review.sh" > "$work.log" 2>&1
 }
 
@@ -945,6 +947,8 @@ scope_round() {
     LAST_REVIEWED_SHA="$(sed -n 's/^reviewed-commit=//p' "$dir/last-review.out")" \
     LAST_FULL_REVIEW_SHA="$(sed -n 's/^full-review=//p' "$dir/last-review.out")" \
     LAST_REVIEW_RESULT="$(sed -n 's/^result=//p' "$dir/last-review.out")" \
+    LAST_BASE_REF="$(sed -n 's/^base-ref=//p' "$dir/last-review.out")" \
+    LAST_MERGE_BASE="$(sed -n 's/^merge-base=//p' "$dir/last-review.out")" \
     "$@" || fail "prepare-review.sh failed: $(cat "$dir/work.log")"
   PATH="$bin:$PATH" COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$dir/work" \
   REVIEW_MODEL=gpt-5.6-sol GITHUB_ACTION_PATH="$ROOT" \
@@ -965,16 +969,20 @@ expect_scope_line() {
     || fail "$1 lacks the scope line for $2..$3 with the full review at $4"
 }
 
-# usage: expect_full_review <round dir> <head>
+# A full review of <head> against <base branch> at <base sha> (by default main
+# at scope_base), which records that base for the runs that build on it.
+# usage: expect_full_review <round dir> <head> [base branch] [base sha]
 expect_full_review() {
-  git -C "$scope_repo" diff "$scope_base...$2" > "$1/full.diff"
+  local base_sha=${4:-$scope_base}
+  git -C "$scope_repo" diff "$base_sha...$2" > "$1/full.diff"
   cmp -s "$1/full.diff" "$1/work/pr.diff" || fail "$1 did not review the whole pull request"
   [ ! -e "$1/work/scope.since" ] || fail "$1 is a full review, not an incremental one"
   if grep -Fq "Incremental review" "$1/sticky.md"; then
     fail "a full review's sticky must add no visible line"
   fi
-  [ "$(sticky_scope_fields < "$1/sticky.md")" = "clean $2 complete" ] \
-    || fail "a full review must be the one later runs build on"
+  [ "$(sticky_scope_fields < "$1/sticky.md")" \
+    = "clean $2 complete ${3:-main} $(git -C "$scope_repo" merge-base "$base_sha" "$2")" ] \
+    || fail "a full review must be the one later runs build on: $(sticky_scope_fields < "$1/sticky.md")"
 }
 
 # A first run reviews the whole pull request, and its sticky records that.
@@ -995,7 +1003,8 @@ fi
 r2="$TEMP_DIR/round2"
 scope_round "$r2" "$head2" "$stub_bin" "$r1/sticky.md"
 [ "$(cat "$r2/last-review.out")" \
-  = "$(printf '%s\n' "reviewed-commit=$head1" "full-review=$head1" "result=clean")" ] \
+  = "$(printf '%s\n' "reviewed-commit=$head1" "full-review=$head1" "result=clean" \
+    "base-ref=main" "merge-base=$scope_base")" ] \
   || fail "unexpected last review: $(cat "$r2/last-review.out")"
 git -C "$scope_repo" diff "$head1" "$head2" > "$r2/since.diff"
 cmp -s "$r2/since.diff" "$r2/work/pr.diff" || fail "the second run must review only head1..head2"
@@ -1023,7 +1032,7 @@ grep -Fxq "_Reviewed commit: \`$head2\`_" "$r2/sticky.md" \
 [ "$(sticky_header_fields < "$r2/sticky.md")" = "$head2 900 1" ] \
   || fail "an incremental review's sticky must name its head"
 expect_scope_line "$r2/sticky.md" "$head1" "$head2" "$head1"
-[ "$(sticky_scope_fields < "$r2/sticky.md")" = "clean $head1 complete" ] \
+[ "$(sticky_scope_fields < "$r2/sticky.md")" = "clean $head1 complete main $scope_base" ] \
   || fail "an incremental review must carry the full review forward"
 fixture=$(gh_fixture "$head2" "$(comment 50 "$bot" "$(cat "$r2/sticky.md")")")
 PATH="$gh_bin:$PATH" STUB_DIR="$fixture" GH_TOKEN=stub REPOSITORY=shariqh/example \
@@ -1032,9 +1041,9 @@ GITHUB_ACTION_PATH="$ROOT" "$ROOT/scripts/verify-landed.sh" > "$fixture/verify.o
   || fail "verify-landed rejected an incremental sticky: $(cat "$fixture/verify.out")"
 
 # A merge of the base branch into the pull request stays out of the next
-# incremental diff, whether the base comes from the base branch's tip or from
-# an up-to-date BASE_SHA. Its change to main.txt is in the plain diff since
-# head2, and a glob `*` would have matched it.
+# incremental diff, whether the base comes from the base branch's tip or,
+# with that ref absent, from an up-to-date BASE_SHA. Its change to main.txt
+# is in the plain diff since head2, and a glob `*` would have matched it.
 r3="$TEMP_DIR/round3"
 scope_round "$r3" "$head4" "$stub_bin" "$r2/sticky.md"
 git -C "$scope_repo" diff "$head2" "$head4" > "$r3/plain.diff"
@@ -1048,7 +1057,9 @@ if grep -Fxq -- "- main.txt" "$r3/work/prompt.txt"; then
 fi
 expect_scope_line "$r3/sticky.md" "$head2" "$head4" "$head1"
 r3_sha="$TEMP_DIR/round3-base-sha"
-scope_round "$r3_sha" "$head4" "$stub_bin" "$r2/sticky.md" BASE_SHA="$main1" BASE_REF=
+scope_git update-ref -d refs/remotes/origin/main
+scope_round "$r3_sha" "$head4" "$stub_bin" "$r2/sticky.md" BASE_SHA="$main1"
+scope_git update-ref refs/remotes/origin/main "$main1"
 cmp -s "$r3/work/pr.diff" "$r3_sha/work/pr.diff" \
   || fail "the incremental diff depends on where the base came from"
 
@@ -1067,18 +1078,37 @@ if grep -Fq "No issues found." "$r3_empty/sticky.md"; then
   fail "an empty incremental diff was reported as a clean review"
 fi
 expect_scope_line "$r3_empty/sticky.md" "$head2" "$head3" "$head1"
-[ "$(sticky_scope_fields < "$r3_empty/sticky.md")" = "clean $head1 complete" ] \
+[ "$(sticky_scope_fields < "$r3_empty/sticky.md")" = "clean $head1 complete main $main1" ] \
   || fail "an empty incremental diff must keep a clean result"
 r2_findings="$TEMP_DIR/round2-findings"
 scope_round "$r2_findings" "$head2" "$finding_bin" "$r1/sticky.md"
-[ "$(sticky_scope_fields < "$r2_findings/sticky.md")" = "findings $head1 complete" ] \
+[ "$(sticky_scope_fields < "$r2_findings/sticky.md")" \
+  = "findings $head1 complete main $scope_base" ] \
   || fail "a complete review with findings must be recorded as complete"
 r3_empty_findings="$TEMP_DIR/round3-empty-findings"
 scope_round "$r3_empty_findings" "$head3" "$stub_bin" "$r2_findings/sticky.md"
 assert_contains "$r3_empty_findings/sticky.md" \
   "so the findings of the review of that commit still apply"
-[ "$(sticky_scope_fields < "$r3_empty_findings/sticky.md")" = "findings $head1 complete" ] \
+[ "$(sticky_scope_fields < "$r3_empty_findings/sticky.md")" \
+  = "findings $head1 complete main $main1" ] \
   || fail "an empty incremental diff must keep a findings result"
+
+# A clean incremental round after findings re-checked only the new commits,
+# so it keeps the result findings and says the earlier findings still stand;
+# the next full review clears them.
+r4_carried="$TEMP_DIR/round4-findings-carried"
+scope_round "$r4_carried" "$head4" "$stub_bin" "$r2_findings/sticky.md"
+assert_contains "$r4_carried/sticky.md" \
+  "_No new issues in the commits since \`$head2\`, but the findings of the review of that commit were not re-checked and still stand. This comment's edit history has them._"
+if grep -Fq "No issues found." "$r4_carried/sticky.md"; then
+  fail "a clean round after findings was reported as a clean review"
+fi
+expect_scope_line "$r4_carried/sticky.md" "$head2" "$head4" "$head1"
+[ "$(sticky_scope_fields < "$r4_carried/sticky.md")" = "findings $head1 complete main $main1" ] \
+  || fail "a clean incremental round must keep an earlier findings result"
+r5_cleared="$TEMP_DIR/round5-findings-cleared"
+scope_round "$r5_cleared" "$head2b" "$stub_bin" "$r4_carried/sticky.md"
+expect_full_review "$r5_cleared" "$head2b"
 
 # Fallback to a full review after a force-push, a failed review or a partial
 # one. A full review starts a new chain: later runs name it as the full one.
@@ -1089,12 +1119,12 @@ assert_contains "$r_force/work.log" \
 expect_full_review "$r_force" "$head2b"
 r_down="$TEMP_DIR/round-down"
 scope_round "$r_down" "$head2" "$down_bin" "$r1/sticky.md"
-[ "$(sticky_scope_fields < "$r_down/sticky.md")" = "findings $head1 incomplete" ] \
+[ "$(sticky_scope_fields < "$r_down/sticky.md")" = "findings $head1 incomplete main $scope_base" ] \
   || fail "a review whose calls failed must be recorded as incomplete"
 r_partial="$TEMP_DIR/round-partial"
 scope_round "$r_partial" "$head2" "$stub_bin" "$r1/sticky.md" FILE_MAX_BYTES=40
 assert_contains "$r_partial/sticky.md" "**Partial coverage**"
-[ "$(sticky_scope_fields < "$r_partial/sticky.md")" = "findings $head1 incomplete" ] \
+[ "$(sticky_scope_fields < "$r_partial/sticky.md")" = "findings $head1 incomplete main $scope_base" ] \
   || fail "a partial review must be recorded as incomplete"
 for previous in "$r_down" "$r_partial"; do
   after="$previous-after"
@@ -1104,19 +1134,71 @@ for previous in "$r_down" "$r_partial"; do
   expect_full_review "$after" "$head4"
 done
 
+# The base each review was made against. A pull request on develop is
+# reviewed in full, without develop's own change to dev.txt. When develop
+# moves forward, the next round stays incremental. When the pull request is
+# retargeted to main, with or without a new commit, or develop is rewound
+# past the merge base, dev.txt's change becomes the pull request's, so the
+# review is full and includes it, never an incremental or empty one.
+scope_git checkout -q "$scope_base"
+develop1=$(scope_commit dev.txt "develop change")
+dhead1=$(scope_commit a.txt "on develop, first")
+dhead2=$(scope_commit a.txt "on develop, second")
+scope_git checkout -q "$develop1"
+develop2=$(scope_commit dev.txt "later develop change")
+scope_git update-ref refs/remotes/origin/develop "$develop1"
+d1="$TEMP_DIR/round-develop"
+scope_round "$d1" "$dhead1" "$stub_bin" - BASE_REF=develop BASE_SHA="$develop1"
+expect_full_review "$d1" "$dhead1" develop "$develop1"
+if grep -Fq "develop change" "$d1/work/pr.diff"; then
+  fail "the base branch's own change was reviewed as the pull request's"
+fi
+scope_git update-ref refs/remotes/origin/develop "$develop2"
+d_forward="$TEMP_DIR/round-develop-forward"
+scope_round "$d_forward" "$dhead2" "$stub_bin" "$d1/sticky.md" \
+  BASE_REF=develop BASE_SHA="$develop1"
+git -C "$scope_repo" diff "$dhead1" "$dhead2" > "$d_forward/since.diff"
+cmp -s "$d_forward/since.diff" "$d_forward/work/pr.diff" \
+  || fail "a base that only moved forward must leave the review incremental"
+expect_scope_line "$d_forward/sticky.md" "$dhead1" "$dhead2" "$dhead1"
+for retarget_head in "$dhead2" "$dhead1"; do
+  d_retarget="$TEMP_DIR/round-retarget-${retarget_head:0:7}"
+  scope_round "$d_retarget" "$retarget_head" "$stub_bin" "$d1/sticky.md"
+  assert_contains "$d_retarget/work.log" \
+    "review scope: full review, because the base branch changed since the last review, which was against develop"
+  expect_full_review "$d_retarget" "$retarget_head"
+  assert_contains "$d_retarget/work/pr.diff" "+develop change"
+  if grep -Fq "Nothing new to review" "$d_retarget/sticky.md"; then
+    fail "a retarget was reported as an empty incremental review"
+  fi
+done
+scope_git update-ref refs/remotes/origin/develop "$scope_base"
+d_rewound="$TEMP_DIR/round-develop-rewound"
+scope_round "$d_rewound" "$dhead2" "$stub_bin" "$d1/sticky.md" BASE_REF=develop
+assert_contains "$d_rewound/work.log" \
+  "review scope: full review, because the base branch develop was rewound or rewritten since the last review"
+expect_full_review "$d_rewound" "$dhead2" develop
+assert_contains "$d_rewound/work/pr.diff" "+develop change"
+
 # A sticky that cannot be built on means a full review: an unreadable comment
 # list; a sticky from a run without since-last-review, or one whose scope
-# lines are only quoted below the header; a malformed header; another
-# reviewer's sticky quoting the marker, or someone else's comment; and a
-# newer sticky without scope lines next to an older one with them.
-# usage: scope_sticky_body <marker> <sha> <full review> <coverage> <result> [findings]
+# lines are only quoted below the header; a malformed header, or one without
+# a base; another reviewer's sticky quoting the marker, or someone else's
+# comment; and a newer sticky without scope lines next to an older one with
+# them.
+# usage: scope_sticky_body <marker> <sha> <full review> <coverage> <result>
+#        <base branch and merge base, or - for none> [findings]
 scope_sticky_body() {
   printf '%s\n' "<!-- $1 -->" "## AI code review (\`gpt-5.6-sol\` via Copilot CLI)" "" \
     "_Reviewed commit: \`$2\`_" "" "<!-- ai-code-review-run: 900 -->" \
-    "<!-- ai-code-review-attempt: 1 -->" "<!-- ai-code-review-full-review: $3 -->" \
-    "<!-- ai-code-review-coverage: $4 -->" "<!-- ai-code-review-result: $5 -->" "" \
-    "${6:-No issues found.}"
+    "<!-- ai-code-review-attempt: 1 -->" "<!-- ai-code-review-full-review: $3 -->"
+  if [ "$6" != - ]; then
+    printf '%s\n' "<!-- ai-code-review-base: $6 -->"
+  fi
+  printf '%s\n' "<!-- ai-code-review-coverage: $4 -->" "<!-- ai-code-review-result: $5 -->" "" \
+    "${7:-No issues found.}"
 }
+on_main="main $scope_base"
 
 # usage: expect_no_last_review <label> <reason> <fixture dir>
 expect_no_last_review() {
@@ -1125,11 +1207,12 @@ expect_no_last_review() {
   assert_contains "$3/last-review.log" "review scope: full review, because $2"
 }
 
-fixture=$(gh_fixture "$head2" \
-  "$(comment 50 "$bot" "$(scope_sticky_body "$sol" "$head2" "$head1" complete findings)")")
+fixture=$(gh_fixture "$head2" "$(comment 50 "$bot" \
+  "$(scope_sticky_body "$sol" "$head2" "$head1" complete findings "$on_main")")")
 run_last_review "$fixture" || fail "last-review.sh failed: $(cat "$fixture/last-review.log")"
 [ "$(cat "$fixture/last-review.out")" \
-  = "$(printf '%s\n' "reviewed-commit=$head2" "full-review=$head1" "result=findings")" ] \
+  = "$(printf '%s\n' "reviewed-commit=$head2" "full-review=$head1" "result=findings" \
+    "base-ref=main" "merge-base=$scope_base")" ] \
   || fail "a valid sticky was not built on: $(cat "$fixture/last-review.log")"
 
 broken=$(gh_fixture "$head2")
@@ -1138,17 +1221,22 @@ expect_no_last_review "an unreadable comment list" \
   "this reviewer's sticky comment could not be read" "$broken"
 cannot_build="sticky comment 50 records no review that an incremental review can build on"
 quoted_scope=$(printf '%s\n' "<!-- ai-code-review-full-review: $head1 -->" \
-  "<!-- ai-code-review-coverage: complete -->")
+  "<!-- ai-code-review-base: $on_main -->" "<!-- ai-code-review-coverage: complete -->")
 case_number=0
 for case_body in \
   "$(sticky_body "$sol" "$head1" 900 1)" \
   "$(sticky_body "$sol" "$head1" 900 1 "$quoted_scope")" \
-  "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean | grep -v 'ai-code-review-result')" \
-  "$(scope_sticky_body "$sol" "${head1:0:12}" "$head1" complete clean)" \
-  "$(scope_sticky_body "$sol" "$(printf '%s' "$head1" | tr 'a-f' 'A-F')" "$head1" complete clean)" \
-  "$(scope_sticky_body "$sol" "$head1" "${head1:0:12}" complete clean)" \
-  "$(scope_sticky_body "$sol" "$head1" "$head1" partly clean)" \
-  "$(scope_sticky_body "$sol" "$head1" "$head1" complete maybe)"; do
+  "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "$on_main" \
+    | grep -v 'ai-code-review-result')" \
+  "$(scope_sticky_body "$sol" "${head1:0:12}" "$head1" complete clean "$on_main")" \
+  "$(scope_sticky_body "$sol" "$(printf '%s' "$head1" | tr 'a-f' 'A-F')" "$head1" complete \
+    clean "$on_main")" \
+  "$(scope_sticky_body "$sol" "$head1" "${head1:0:12}" complete clean "$on_main")" \
+  "$(scope_sticky_body "$sol" "$head1" "$head1" partly clean "$on_main")" \
+  "$(scope_sticky_body "$sol" "$head1" "$head1" complete maybe "$on_main")" \
+  "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean -)" \
+  "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "main branch $scope_base")" \
+  "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "main ${scope_base:0:12}")"; do
   case_number=$((case_number + 1))
   expect_no_last_review "unusable sticky $case_number" "$cannot_build" \
     "$(gh_fixture "$head2" "$(comment 50 "$bot" "$case_body")")"
@@ -1157,17 +1245,19 @@ expect_no_last_review "another reviewer's quoting sticky or a non-bot comment" \
   "this reviewer has not reviewed this pull request yet" \
   "$(gh_fixture "$head2" \
     "$(comment 60 "$bot" "$(scope_sticky_body "$astra" "$head1" "$head1" complete clean \
-      "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean)")")" \
-    "$(comment 70 someone "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean)")")"
+      "$on_main" "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "$on_main")")")" \
+    "$(comment 70 someone \
+      "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "$on_main")")")"
 expect_no_last_review "a newer sticky without scope lines" \
   "sticky comment 45 records no review that an incremental review can build on" \
   "$(gh_fixture "$head2" \
-    "$(comment 40 "$bot" "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean)")" \
+    "$(comment 40 "$bot" "$(scope_sticky_body "$sol" "$head1" "$head1" complete clean "$on_main")")" \
     "$(comment 45 "$bot" "$(sticky_body "$sol" "$head1" 900 1)")")"
 
 # prepare-review.sh checks what last-review.sh hands it, too.
 for bad_last in "LAST_REVIEWED_SHA=$head1~1" "LAST_REVIEWED_SHA=$head1$(printf '\nx')" \
-  LAST_FULL_REVIEW_SHA= LAST_REVIEW_RESULT=maybe; do
+  LAST_FULL_REVIEW_SHA= LAST_REVIEW_RESULT=maybe LAST_BASE_REF= 'LAST_BASE_REF=::main' \
+  LAST_MERGE_BASE= "LAST_MERGE_BASE=${scope_base:0:12}"; do
   prepare_since "$TEMP_DIR/bad-last" "$head2" "$bad_last" \
     || fail "prepare-review.sh failed: $(cat "$TEMP_DIR/bad-last.log")"
   assert_contains "$TEMP_DIR/bad-last.log" \
@@ -1228,6 +1318,17 @@ prepare_since "$TEMP_DIR/list-cap" "$head2" FILE_LIST_MAX_BYTES=12 \
   = "$(printf '%s\n' '- *' '- a.txt' '- [2 more not listed]')" ] \
   || fail "unexpected bounded file list: $(cat "$TEMP_DIR/list-cap/scope.files")"
 
+# A path list that cannot be sorted means a full review, not a short list.
+sort_bin="$TEMP_DIR/sort-bin"
+mkdir -p "$sort_bin"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$sort_bin/sort"
+chmod +x "$sort_bin/sort"
+prepare_since "$TEMP_DIR/unsorted" "$head2" PATH="$sort_bin:$PATH" \
+  || fail "prepare-review.sh failed: $(cat "$TEMP_DIR/unsorted.log")"
+assert_contains "$TEMP_DIR/unsorted.log" \
+  "review scope: full review, because the pull request's files could not be listed"
+[ ! -e "$TEMP_DIR/unsorted/scope.since" ] || fail "an unsorted path list was built on"
+
 # The scope record's values reach the comment and the prompt, so
 # post-comment.sh and run-review.sh refuse one that prepare-review.sh could
 # not have written: a malformed or missing full review, since or previous
@@ -1266,6 +1367,16 @@ for scope in "not-a-sha $head1 clean" "- $head1 clean" "$head1 HEAD~1 clean" \
     assert_contains "$work/run.out" \
       "::error::the incremental review scope recorded by prepare-review.sh is malformed"
   fi
+done
+for bad_base in "main not-a-sha" "main branch $head1" "::main $head1"; do
+  work=$(scope_case "$head1" "$head1" clean)
+  printf '%s\n' "$bad_base" > "$work/scope.base"
+  fixture=$(gh_fixture "$verify_head")
+  if run_post "$fixture" "$work"; then
+    fail "post-comment.sh accepted the base record: $bad_base"
+  fi
+  assert_contains "$fixture/post.out" \
+    "::error::scope.base does not hold a branch name and a commit SHA"
 done
 
 install_line=$(grep -n 'npm install --global --ignore-scripts' "$ROOT/action.yml" | cut -d: -f1)

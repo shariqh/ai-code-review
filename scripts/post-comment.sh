@@ -24,6 +24,33 @@ fi
 source "$GITHUB_ACTION_PATH/scripts/lib.sh"
 cd "$REVIEW_WORK_DIR"
 
+# review-scope since-last-review: prepare-review.sh writes scope.full-review,
+# the commit of the full review this one builds on (the head itself for a full
+# review), and for an incremental review also scope.since, the head this
+# reviewer last reviewed, and scope.previous-result, that review's result.
+# With review-scope full there are none, and the comment is unchanged. The
+# values go into the header, so each must be exactly what prepare-review.sh
+# writes.
+full_review=""
+since=""
+previous_result=""
+if [ -s scope.full-review ]; then
+  full_review=$(cat scope.full-review)
+  if ! [[ "$full_review" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "::error::scope.full-review does not hold a commit SHA"
+    exit 1
+  fi
+fi
+if [ -s scope.since ]; then
+  since=$(cat scope.since)
+  previous_result=$(cat scope.previous-result 2>/dev/null || true)
+  if ! [[ "$since" =~ ^[0-9a-f]{40}$ ]] || [ -z "$full_review" ] \
+    || ! [[ "$previous_result" =~ ^(clean|findings)$ ]]; then
+    echo "::error::the incremental review scope recorded by prepare-review.sh is malformed"
+    exit 1
+  fi
+fi
+
 marker="<!-- $COMMENT_MARKER -->"
 {
   echo "$marker"
@@ -31,11 +58,31 @@ marker="<!-- $COMMENT_MARKER -->"
   echo
   echo "_Reviewed commit: \`$HEAD_SHA\`_"
   echo
+  # An incremental review says so under the reviewed commit, which stays the
+  # head so that verify-landed and other readers work unchanged. A full
+  # review adds nothing visible.
+  if [ -n "$since" ]; then
+    echo "> **Incremental review** of \`$since..$HEAD_SHA\`; the full review was at \`$full_review\`."
+    echo
+  fi
   echo "<!-- ai-code-review-run: $RUN_ID -->"
   echo "<!-- ai-code-review-attempt: $RUN_ATTEMPT -->"
+  # What the next since-last-review run reads (sticky_scope_fields): the full
+  # review to name, and whether this review covered everything it was given.
+  if [ -n "$full_review" ]; then
+    echo "<!-- ai-code-review-full-review: $full_review -->"
+    if is_complete_review "$REVIEW_WORK_DIR"; then
+      echo "<!-- ai-code-review-coverage: complete -->"
+    else
+      echo "<!-- ai-code-review-coverage: incomplete -->"
+    fi
+  fi
   # The result marker ends the header that sticky_header_fields reads; model
-  # output only ever follows it.
-  if is_complete_clean_review "$REVIEW_WORK_DIR"; then
+  # output only ever follows it. An empty incremental diff reviewed nothing
+  # new, so the last review's result stands.
+  if is_empty_incremental_review "$REVIEW_WORK_DIR"; then
+    echo "<!-- ai-code-review-result: $previous_result -->"
+  elif is_complete_clean_review "$REVIEW_WORK_DIR"; then
     echo "<!-- ai-code-review-result: clean -->"
   else
     echo "<!-- ai-code-review-result: findings -->"

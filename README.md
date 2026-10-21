@@ -14,7 +14,9 @@ It comes in two forms:
 
 Both use high reasoning effort and the long context tier by default, batch
 large diffs at file boundaries, disclose any truncation or failed model calls,
-and never report a failed or partial review as clean.
+and never report a failed or partial review as clean. Optionally, later
+rounds review only the commits since each reviewer's last review (see
+[Incremental reviews](#incremental-reviews)).
 
 ## Copilot token
 
@@ -100,6 +102,7 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `max-batches` | `8` | Maximum model calls per reviewer |
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context (base branch only; empty disables) |
+| `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since each reviewer's last complete review |
 
 The only secret is `COPILOT_REVIEW_PAT`. Without it, a reviewer job on an
 eligible pull request fails, since `verify-landed` asks for a job that fails
@@ -202,6 +205,7 @@ be present.
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
 | `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
+| `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since this reviewer's last complete review |
 
 ## When a review call fails
 
@@ -237,6 +241,66 @@ pull request cannot rewrite the instructions that review it — edits to the
 context file take effect only after they land on the base branch, and then
 apply to already-open PRs on their next review. Content beyond 16 KB is
 truncated with a note.
+
+## Incremental reviews
+
+By default every run reviews the whole pull request, so a push that only
+fixes the last round's findings is reviewed in full again. With
+`review-scope: since-last-review`, the first review of a pull request is a
+full review, and each later run reviews only the commits since the head that
+reviewer last reviewed:
+
+- The previous head is the reviewed commit in the reviewer's own sticky
+  comment, never the push event's `before`, so only a review that landed
+  counts; a run that a newer push cancelled never does.
+- The diff is `git diff <previous head> <head>`, limited to the files the pull
+  request itself changes: those that differ between the base and the previous
+  head, or between the base and the new head. A merge of the base branch into
+  the pull request is therefore not reviewed as its own change, while a file
+  it changed and then reverted still is. As for the review context, the base
+  is the base branch's current tip, or the event's base SHA when the checkout
+  lacks it.
+- The prompt says the review is incremental and lists the files the whole pull
+  request changes (up to 8 KB of names), for orientation. The maintainer
+  review context applies as usual.
+- Batching, truncation and failure disclosure work as for a full review.
+
+The run reviews the whole pull request instead, and the job log says why,
+when:
+
+- the reviewer has no sticky comment on the pull request yet, or it cannot be
+  read;
+- the sticky was written without `since-last-review`, or its header is
+  malformed;
+- the last review was incomplete: a review call failed, or coverage was
+  partial;
+- the last reviewed head is not an ancestor of the new head, as after a
+  force-push or rebase, or the checkout lacks it and fetching it fails;
+- the incremental diff cannot be built, for example because the base and the
+  head share no history.
+
+A full review, including a fallback, adds no visible line. An incremental
+review keeps the `_Reviewed commit: <head>_` line, so `verify-landed` and
+anything else that reads it work unchanged, and adds a line below it:
+
+> **Incremental review** of `<previous head>..<head>`; the full review was at `<sha>`.
+
+`<sha>` is the head the full review covered, carried forward from round to
+round. When none of the pull request's files changed since the last review,
+for example after merging the base branch in or when a run is re-run on the
+same head, no model is called: the comment says there was nothing new to
+review and keeps the last review's result.
+
+Under `since-last-review` the comment's header also records, for the next
+run, the full review's commit (`<!-- ai-code-review-full-review: <sha> -->`)
+and whether the review covered everything
+(`<!-- ai-code-review-coverage: complete -->` or `incomplete`). The
+`ai-code-review-result` marker covers what was reviewed, so on an incremental
+review `clean` means the commits since the last review raised nothing.
+
+To review a pull request in full again, run with `review-scope: full`. That
+comment records no scope, so the next `since-last-review` run is a full
+review too, and later runs build on it.
 
 ## Security model
 
@@ -287,6 +351,16 @@ truncated with a note.
 - The reviewed commit, run id and run attempt are read only from the
   comment's header, which ends before any model output, so quoted copies of
   those lines further down are ignored.
+- With `review-scope: since-last-review`, the previous head comes from the
+  same header of the reviewer's own sticky, read with the same `github-token`
+  that posts it. It is used only if it is a full 40-hex commit SHA from a
+  complete review and an ancestor of the PR head, every value is checked
+  against a strict pattern before it reaches git or the prompt, and no comment
+  text reaches a shell command. Besides reading the PR's comments, the only
+  added network access is one
+  `git fetch --no-tags --no-recurse-submodules origin <sha>`, without
+  credentials, when the checkout lacks that commit. The PR's file names, which
+  the prompt lists, are marked as untrusted data like the diff.
 - The PR head is rechecked before the sticky comment changes.
 
 The review is advisory and is not a substitute for human review.

@@ -71,6 +71,14 @@ inputs:
       verify-landed is on. For smoke tests that run without the secret.
     required: false
     default: "false"
+  review-scope:
+    description: >-
+      full reviews the whole pull request on every run. since-last-review
+      reviews it in full once, then only the commits since the head this
+      reviewer last reviewed completely, falling back to a full review when
+      that head cannot be trusted (see the README).
+    required: false
+    default: full
 
 runs:
   using: composite
@@ -93,6 +101,7 @@ runs:
         OWNER_ONLY: ${{ inputs.owner-only }}
         VERIFY_LANDED: ${{ inputs.verify-landed }}
         ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
+        REVIEW_SCOPE: ${{ inputs.review-scope }}
         REVIEW_MODEL: ${{ inputs.model }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
@@ -131,6 +140,19 @@ runs:
         ref: ${{ github.event.pull_request.head.sha }}
         path: .ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
 
+    # Only for review-scope since-last-review: read the head this reviewer
+    # last reviewed from its own sticky comment.
+    - name: Find this reviewer's last review
+      id: last-review
+      if: steps.guard.outputs.skip == 'false' && inputs.review-scope == 'since-last-review'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
+      run: "$GITHUB_ACTION_PATH/scripts/last-review.sh"
+
     - name: Build review batches
       if: steps.guard.outputs.skip == 'false'
       shell: bash
@@ -144,6 +166,10 @@ runs:
         FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
         MAX_BATCHES: ${{ inputs.max-batches }}
         CONTEXT_FILE: ${{ inputs.context-file }}
+        REVIEW_SCOPE: ${{ inputs.review-scope }}
+        LAST_REVIEWED_SHA: ${{ steps.last-review.outputs.reviewed-commit }}
+        LAST_FULL_REVIEW_SHA: ${{ steps.last-review.outputs.full-review }}
+        LAST_REVIEW_RESULT: ${{ steps.last-review.outputs.result }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
 
     - name: Run adversarial review

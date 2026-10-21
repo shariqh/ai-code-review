@@ -32,6 +32,14 @@ case "${ALLOW_MISSING_TOKEN:-false}" in
     ;;
 esac
 
+case "${REVIEW_SCOPE:-full}" in
+  full|since-last-review) ;;
+  *)
+    echo "::error::review-scope must be full or since-last-review"
+    exit 1
+    ;;
+esac
+
 # Checked before any skip, so a misconfigured reviewer fails loudly on its
 # first run rather than on the first PR that is eligible for review. An empty
 # model must never reach the CLI, which would fall back to its own default.

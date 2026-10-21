@@ -24,6 +24,22 @@ is_complete_clean_review() {
     && [ "$(tr -d '[:space:]' < "$work_dir/review.md")" = "Noissuesfound." ]
 }
 
+# A review is complete when nothing was truncated or left out by the batch
+# cap and no review call failed, whatever it found. Only a complete review can
+# be the starting point of a since-last-review run.
+is_complete_review() {
+  local work_dir=${1:?work directory is required}
+  [ ! -s "$work_dir/overflow.note" ] && [ ! -s "$work_dir/review.failures" ]
+}
+
+# An incremental review with an empty diff: none of the pull request's files
+# changed since the head this reviewer last reviewed (prepare-review.sh
+# writes scope.since only for an incremental review).
+is_empty_incremental_review() {
+  local work_dir=${1:?work directory is required}
+  [ -s "$work_dir/scope.since" ] && [ ! -s "$work_dir/pr.diff" ]
+}
+
 # The jq filter that lists one reviewer's sticky comment ids: comments by
 # github-actions[bot] whose FIRST line is exactly that reviewer's marker. The
 # body carries model output, so a marker found anywhere else in it may be a
@@ -64,6 +80,43 @@ sticky_header_fields() {
       if (run == "") run = "-"
       if (attempt == "") attempt = "-"
       printf "%s %s %s\n", sha, run, attempt
+    }
+  '
+}
+
+# Print the result, full-review commit and coverage recorded in a sticky
+# comment's header as "<result> <full-review> <coverage>", with "-" for
+# anything missing. The result comes from the result marker that ends the
+# header; post-comment.sh writes the other two lines only for review-scope
+# since-last-review. Like sticky_header_fields, it reads the header only.
+sticky_scope_fields() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<!-- ai-code-review-result: / {
+      complete = 1
+      if ($0 ~ /^<!-- ai-code-review-result: [a-z]+ -->$/) {
+        result = $0
+        sub(/^<!-- ai-code-review-result: /, "", result)
+        sub(/ -->$/, "", result)
+      }
+      exit
+    }
+    full == "" && /^<!-- ai-code-review-full-review: [0-9a-f]+ -->$/ {
+      full = $0
+      sub(/^<!-- ai-code-review-full-review: /, "", full)
+      sub(/ -->$/, "", full)
+    }
+    coverage == "" && /^<!-- ai-code-review-coverage: [a-z]+ -->$/ {
+      coverage = $0
+      sub(/^<!-- ai-code-review-coverage: /, "", coverage)
+      sub(/ -->$/, "", coverage)
+    }
+    END {
+      if (!complete) { result = ""; full = ""; coverage = "" }
+      if (result == "") result = "-"
+      if (full == "") full = "-"
+      if (coverage == "") coverage = "-"
+      printf "%s %s %s\n", result, full, coverage
     }
   '
 }

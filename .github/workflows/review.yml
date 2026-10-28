@@ -20,14 +20,16 @@ on:
         default: ubuntu-latest
       reviewers:
         description: >-
-          JSON array with one entry per reviewer (Astra alone by default). Each entry needs a model and
-          a marker that no other reviewer uses, and may set name (the job
-          name, defaulting to the model), timeout-minutes, reasoning-effort
-          and context.
+          JSON array with one entry per reviewer (Sol alone by default). Each
+          entry needs a model and a marker that no other reviewer uses, and
+          may set name (the job name, defaulting to the model),
+          timeout-minutes, reasoning-effort, context, verifier-model,
+          verifier-effort, and min-diff-bytes and paths to review only large
+          or sensitive pull requests.
         type: string
         default: >-
-          [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
-          "timeout-minutes": 40}]
+          [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky",
+          "timeout-minutes": 30}]
       timeout-minutes:
         description: Job timeout for reviewers that do not set their own
         type: number
@@ -68,6 +70,29 @@ on:
         description: Context tier for reviewers that do not set their own
         type: string
         default: long_context
+      verifier-model:
+        description: >-
+          Verifier model for reviewers that do not set their own: it checks
+          each finding against the code before it is posted. An empty string
+          turns verification off.
+        type: string
+        default: gpt-5.6-sol
+      verifier-effort:
+        description: Verifier reasoning effort for reviewers that do not set their own
+        type: string
+        default: low
+      max-verifications:
+        description: Maximum verifier calls per reviewer per run, one per finding
+        type: number
+        default: 10
+      max-nits:
+        description: Maximum findings of severity Nit per review
+        type: number
+        default: 3
+      inline-comments:
+        description: Post each confirmed finding as an inline review comment
+        type: boolean
+        default: true
       batch-max-bytes:
         description: Target maximum bytes per review batch
         type: number
@@ -90,14 +115,32 @@ on:
           branch only. An empty string disables it.
         type: string
         default: .github/ai-review-context.md
+      review-file:
+        description: >-
+          Repo-relative review guide (REVIEW.md), read from the base branch
+          only. An empty string disables it.
+        type: string
+        default: REVIEW.md
+      full-files-max-bytes:
+        description: >-
+          Bytes of the head version of the touched files sent with each
+          batch; 0 leaves them out
+        type: number
+        default: 60000
       review-scope:
         description: >-
-          full reviews the whole pull request on every run. since-last-review
-          reviews it in full once, then each reviewer reviews only the commits
-          since the head it last reviewed completely, falling back to a full
-          review when that head cannot be trusted.
+          since-last-review reviews the pull request in full once, then each
+          reviewer reviews only the commits since the head it last reviewed
+          completely, falling back to a full review when that head cannot be
+          trusted. full reviews the whole pull request on every run.
         type: string
-        default: full
+        default: since-last-review
+      max-rounds:
+        description: >-
+          When findings remain after this many review rounds, a reviewer
+          pauses instead of reviewing again; 0 for no cap
+        type: number
+        default: 3
     secrets:
       COPILOT_REVIEW_PAT:
         description: >-
@@ -162,6 +205,13 @@ jobs:
           comment-marker: ${{ matrix.reviewer.marker }}
           reasoning-effort: ${{ matrix.reviewer.reasoning-effort || inputs.reasoning-effort }}
           context: ${{ matrix.reviewer.context || inputs.context }}
+          verifier-model: ${{ matrix.reviewer.verifier-model || inputs.verifier-model }}
+          verifier-effort: ${{ matrix.reviewer.verifier-effort || inputs.verifier-effort }}
+          min-diff-bytes: ${{ matrix.reviewer.min-diff-bytes || 0 }}
+          paths: ${{ matrix.reviewer.paths || '' }}
+          max-verifications: ${{ inputs.max-verifications }}
+          max-nits: ${{ inputs.max-nits }}
+          inline-comments: ${{ inputs.inline-comments }}
           copilot-cli-version: ${{ inputs.copilot-cli-version }}
           node-version: ${{ inputs.node-version }}
           batch-max-bytes: ${{ inputs.batch-max-bytes }}
@@ -169,6 +219,9 @@ jobs:
           max-batches: ${{ inputs.max-batches }}
           owner-only: ${{ inputs.owner-only }}
           context-file: ${{ inputs.context-file }}
+          review-file: ${{ inputs.review-file }}
+          full-files-max-bytes: ${{ inputs.full-files-max-bytes }}
           review-scope: ${{ inputs.review-scope }}
+          max-rounds: ${{ inputs.max-rounds }}
           verify-landed: ${{ inputs.verify-landed }}
           allow-missing-token: ${{ inputs.allow-missing-token }}

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "oris-1605",
+  "repository": "shariqh/oris",
+  "private": true,
+  "pull_request": 1605,
+  "base": "c7f0154b61f94b98f8897922d9daab8b6341d9cf",
+  "head": "a187f5e0bd9fe5bfba7420c9fa4829b50c69f620",
+  "source": "Round 3 of the oris sample in shariqh/ai-code-review#9 and dev-setup #26.",
+  "expectations": [
+    {
+      "id": "real-catch-data-lifecycle",
+      "kind": "real-catch",
+      "note": "Sol: a new table's rows outlive the deletion path that should remove them. Accepted in triage and fixed in a follow-up pull request.",
+      "severity": ["Important", "Nit"],
+      "keywords": ["erasure", "delete", "cascade", "foreign key"],
+      "locations": [
+        {"path_sha256": "0ac18844831b207e582aea9618a6cf0749786f5dde7d6100b542b4e5b7c69422", "lines": [113, 138]},
+        {"path_sha256": "c16f345715e89c1c4b41a9bdf1e6e124386c0839f32f9436205c23fa456e0a46"}
+      ]
+    },
+    {
+      "id": "false-positive-not-wired",
+      "kind": "false-positive",
+      "class": "not-wired",
+      "note": "Sol, three rounds running: the new module is called dead code, though another changed file imports and calls it.",
+      "locations": [
+        {"path_sha256": "f19f63fd109ac669e85428de4bf7679913fdbf90b25e4494ca63ed3e60c99b02"},
+        {"path_sha256": "c16f345715e89c1c4b41a9bdf1e6e124386c0839f32f9436205c23fa456e0a46"},
+        {"path_sha256": "6ec118e392d03dd4f4616e3aed4c17b603ec058d999caae330ea0a3adefcdb43"}
+      ]
+    }
+  ]
+}

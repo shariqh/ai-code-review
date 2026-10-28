@@ -16,6 +16,18 @@ case "$REVIEW_WORK_DIR" in
   /|""|.) echo "::error::unsafe REVIEW_WORK_DIR"; exit 1 ;;
 esac
 
+# The round cap: when the last review was round MAX_ROUNDS (0 for no cap) or
+# later and left findings, the reviewer stops instead of reviewing again. STICKY_ROUND and
+# STICKY_RESULT are the last review's round count and result, from
+# last-review.sh.
+MAX_ROUNDS=${MAX_ROUNDS:-3}
+if ! [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]]; then
+  echo "::error::max-rounds must be a non-negative integer"
+  exit 1
+fi
+round_previous=${STICKY_ROUND:-0}
+[[ "$round_previous" =~ ^[0-9]{1,4}$ ]] || round_previous=0
+
 rm -rf -- "$REVIEW_WORK_DIR"
 mkdir -p "$REVIEW_WORK_DIR"
 
@@ -30,6 +42,7 @@ mkdir -p "$REVIEW_WORK_DIR"
 # trusted — only maintainers can move it — and always current. Fall back to
 # BASE_SHA when the remote ref is absent (e.g. plain-SHA test fixtures).
 CONTEXT_FILE=${CONTEXT_FILE:-}
+REVIEW_FILE=${REVIEW_FILE:-}
 CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES:-16000}
 BASE_REF=${BASE_REF:-}
 context_rev="$BASE_SHA"
@@ -38,26 +51,41 @@ if [ -n "$BASE_REF" ] && \
       "refs/remotes/origin/$BASE_REF" > /dev/null; then
   context_rev="refs/remotes/origin/$BASE_REF"
 fi
-: > "$REVIEW_WORK_DIR/review-context.md"
-if [ -n "$CONTEXT_FILE" ]; then
-  if git -C "$REVIEW_REPO_DIR" show "$context_rev:$CONTEXT_FILE" \
-      > "$REVIEW_WORK_DIR/review-context.md" 2>/dev/null; then
-    context_bytes=$(wc -c < "$REVIEW_WORK_DIR/review-context.md")
-    if [ "$context_bytes" -gt "$CONTEXT_MAX_BYTES" ]; then
-      head -c "$CONTEXT_MAX_BYTES" "$REVIEW_WORK_DIR/review-context.md" \
-        > "$REVIEW_WORK_DIR/review-context.md.tmp"
-      printf '\n[review context truncated at %s bytes]\n' "$CONTEXT_MAX_BYTES" \
-        >> "$REVIEW_WORK_DIR/review-context.md.tmp"
-      mv "$REVIEW_WORK_DIR/review-context.md.tmp" "$REVIEW_WORK_DIR/review-context.md"
+
+# Writes the base revision's copy of <file> to <out>, cut at
+# CONTEXT_MAX_BYTES with a note; <out> is empty when <file> is empty or not
+# on the base.
+# usage: read_base_file <label> <file> <out>
+read_base_file() {
+  local label=$1 file=$2 out=$3 bytes
+  : > "$out"
+  [ -n "$file" ] || return 0
+  if git -C "$REVIEW_REPO_DIR" show "$context_rev:$file" > "$out" 2>/dev/null; then
+    bytes=$(wc -c < "$out")
+    if [ "$bytes" -gt "$CONTEXT_MAX_BYTES" ]; then
+      head -c "$CONTEXT_MAX_BYTES" "$out" > "$out.tmp"
+      printf '\n[%s truncated at %s bytes]\n' "$label" "$CONTEXT_MAX_BYTES" >> "$out.tmp"
+      mv "$out.tmp" "$out"
     fi
-    echo "review context: $CONTEXT_FILE ($context_bytes bytes from $context_rev)"
+    echo "$label: $file ($bytes bytes from $context_rev)"
   else
-    # Not on the base ref (or unreadable) — review without context. A partial
+    # Not on the base ref (or unreadable) — review without it. A partial
     # write from the failed `git show` must not leak into the prompt.
-    : > "$REVIEW_WORK_DIR/review-context.md"
-    echo "review context: $CONTEXT_FILE not on $context_rev; skipping"
+    : > "$out"
+    echo "$label: $file not on $context_rev; skipping"
   fi
-fi
+}
+
+read_base_file "review context" "$CONTEXT_FILE" "$REVIEW_WORK_DIR/review-context.md"
+# The repository's review guide (REVIEW.md by default): what failure looks
+# like in this repository, paths to skip, decisions already taken. Read from
+# the base branch for the same reason as the review context.
+read_base_file "review guide" "$REVIEW_FILE" "$REVIEW_WORK_DIR/review-guide.md"
+
+# The findings earlier rounds reported (STICKY_LEDGER), so none is reported
+# again, and the round this one follows.
+node "$GITHUB_ACTION_PATH/scripts/findings.mjs" ledger-read "$REVIEW_WORK_DIR"
+printf '%s\n' "$round_previous" > "$REVIEW_WORK_DIR/round.previous"
 
 # review-scope since-last-review: write the diff of the commits since the head
 # this reviewer last reviewed (LAST_REVIEWED_SHA, found by last-review.sh),
@@ -208,6 +236,94 @@ if [ "$incremental" = false ]; then
 fi
 echo "diff bytes: $(wc -c < "$REVIEW_WORK_DIR/pr.diff")"
 
+# The pull request's whole diff, against the same trusted base, as GitHub
+# shows it: the verifier reads what the pull request changes in a file from
+# it, and an inline comment can sit only on a line of one of its hunks.
+full_diff=built
+if git -C "$REVIEW_REPO_DIR" diff "$context_rev...$HEAD_SHA" > "$REVIEW_WORK_DIR/pr-full.diff" \
+  && node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" commentable \
+    "$REVIEW_WORK_DIR/pr-full.diff" "$REVIEW_WORK_DIR/commentable.json"; then
+  :
+else
+  full_diff=failed
+  echo "the pull request's full diff could not be built, so no finding will be posted inline"
+  : > "$REVIEW_WORK_DIR/pr-full.diff"
+  rm -f "$REVIEW_WORK_DIR/commentable.json"
+fi
+
+# A reviewer can be limited to large or sensitive pull requests: it reviews
+# only when the pull request's whole diff is at least MIN_DIFF_BYTES, or it
+# changes a path that matches one of PATHS (shell patterns, separated by
+# commas or newlines, in which * also matches /). Otherwise the step output
+# skip is true and the later steps do nothing. With neither set, every pull
+# request is reviewed. When the conditions cannot be checked, it reviews.
+MIN_DIFF_BYTES=${MIN_DIFF_BYTES:-0}
+if ! [[ "$MIN_DIFF_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "::error::min-diff-bytes must be a non-negative integer"
+  exit 1
+fi
+patterns=()
+IFS=$',\n' read -r -d '' -a raw_patterns <<< "${PATHS:-}" || true
+for pattern in ${raw_patterns[@]+"${raw_patterns[@]}"}; do
+  pattern=$(printf '%s' "$pattern" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$pattern" ] && patterns+=("$pattern")
+done
+if [ "$MIN_DIFF_BYTES" -gt 0 ] || [ "${#patterns[@]}" -gt 0 ]; then
+  gate_reason=""
+  full_bytes=$(wc -c < "$REVIEW_WORK_DIR/pr-full.diff" | tr -d '[:space:]')
+  if [ "$full_diff" = failed ]; then
+    gate_reason="the pull request's diff could not be built to check them"
+  elif [ "$MIN_DIFF_BYTES" -gt 0 ] && [ "$full_bytes" -ge "$MIN_DIFF_BYTES" ]; then
+    gate_reason="its diff is $full_bytes bytes, at least min-diff-bytes ($MIN_DIFF_BYTES)"
+  fi
+  if [ -z "$gate_reason" ] && [ "${#patterns[@]}" -gt 0 ]; then
+    if git -C "$REVIEW_REPO_DIR" diff --name-only -z "$context_rev...$HEAD_SHA" \
+        > "$REVIEW_WORK_DIR/gate.paths"; then
+      while IFS= read -r -d '' path && [ -z "$gate_reason" ]; do
+        for pattern in "${patterns[@]}"; do
+          # shellcheck disable=SC2053 # the pattern is a glob on purpose
+          if [[ "$path" == $pattern ]]; then
+            gate_reason="it changes $path, which matches $pattern"
+            break
+          fi
+        done
+      done < "$REVIEW_WORK_DIR/gate.paths"
+    else
+      gate_reason="its paths could not be listed"
+    fi
+  fi
+  if [ -z "$gate_reason" ]; then
+    paths_shown=${PATHS:-}
+    paths_shown=${paths_shown//$'\n'/, }
+    echo "::notice::This reviewer reviews only pull requests whose diff is at least ${MIN_DIFF_BYTES} bytes (0 means no size condition) or that change a path matching '${paths_shown}'; this one does neither, so it is skipped."
+    echo "skip=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+    exit 0
+  fi
+  echo "reviewer conditions: met, because $gate_reason"
+fi
+echo "skip=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+
+# Paused: the last review was round MAX_ROUNDS or later and left findings,
+# and there is something new to review. No model is called; the comment says
+# the new commits were not reviewed and asks for the approach to be
+# reconsidered. Deleting the sticky comment starts over.
+if [ "$MAX_ROUNDS" -gt 0 ] && [ "$round_previous" -ge "$MAX_ROUNDS" ] \
+  && [ "${STICKY_RESULT:-}" = findings ] \
+  && ! { [ -s "$REVIEW_WORK_DIR/scope.since" ] && [ ! -s "$REVIEW_WORK_DIR/pr.diff" ]; }; then
+  printf '%s\n' "$round_previous" > "$REVIEW_WORK_DIR/scope.paused"
+  mkdir -p "$REVIEW_WORK_DIR/batches"
+  : > "$REVIEW_WORK_DIR/overflow.note"
+  echo "0" > "$REVIEW_WORK_DIR/batch.count"
+  echo "review paused: round $round_previous of at most $MAX_ROUNDS left findings, so no model is called"
+  exit 0
+fi
+
 "$GITHUB_ACTION_PATH/scripts/chunk-diff.sh" \
   "$REVIEW_WORK_DIR/pr.diff" \
   "$REVIEW_WORK_DIR"
+
+# The head version of each file a batch touches, numbered by line, so the
+# finder can see how the changed code is called and defined rather than
+# guess. Read from the head commit's objects, never the working tree.
+node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" head-files \
+  "$REVIEW_WORK_DIR" "$REVIEW_REPO_DIR" "$HEAD_SHA"

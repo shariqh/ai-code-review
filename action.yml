@@ -9,9 +9,34 @@ inputs:
     description: Caller repository GITHUB_TOKEN used to manage the sticky comment
     required: true
   model:
-    description: Copilot CLI model identifier
+    description: Copilot CLI model identifier of the finder
     required: false
     default: gpt-5.6-sol
+  verifier-model:
+    description: >-
+      Copilot CLI model identifier of the verifier, which checks each finding
+      against the code before it is posted. Empty turns verification off:
+      findings are then listed unverified and none is posted inline.
+    required: false
+    default: gpt-5.6-sol
+  verifier-effort:
+    description: Reasoning effort passed to Copilot CLI for the verifier
+    required: false
+    default: low
+  max-verifications:
+    description: Maximum verifier calls per run, one per finding
+    required: false
+    default: "10"
+  max-nits:
+    description: Maximum findings of severity Nit reported per review
+    required: false
+    default: "3"
+  inline-comments:
+    description: >-
+      Post each confirmed finding as an inline review comment on its line, in
+      addition to the sticky comment
+    required: false
+    default: "true"
   copilot-cli-version:
     description: Exact @github/copilot package version
     required: false
@@ -53,6 +78,21 @@ inputs:
       a missing file is skipped silently.
     required: false
     default: .github/ai-review-context.md
+  review-file:
+    description: >-
+      Repo-relative path to the repository's review guide (what a failure
+      looks like here, paths to skip, decisions taken), injected into the
+      finder's and verifier's prompts. Read from the PR BASE ref like
+      context-file. Empty string disables it; a missing file is skipped.
+    required: false
+    default: REVIEW.md
+  full-files-max-bytes:
+    description: >-
+      Bytes of the head version of the touched files sent with each batch,
+      numbered by line, so the finder can check how changed code is called;
+      0 leaves them out
+    required: false
+    default: "60000"
   comment-marker:
     description: Identifier used for the sticky PR comment
     required: false
@@ -73,12 +113,33 @@ inputs:
     default: "false"
   review-scope:
     description: >-
-      full reviews the whole pull request on every run. since-last-review
-      reviews it in full once, then only the commits since the head this
-      reviewer last reviewed completely, falling back to a full review when
-      that head cannot be trusted (see the README).
+      since-last-review reviews the pull request in full once, then only the
+      commits since the head this reviewer last reviewed completely, falling
+      back to a full review when that head cannot be trusted (see the
+      README). full reviews the whole pull request on every run.
     required: false
-    default: full
+    default: since-last-review
+  min-diff-bytes:
+    description: >-
+      Review only pull requests whose whole diff is at least this many bytes,
+      or that change a path matching paths; 0 sets no size condition. With
+      neither set, every pull request is reviewed.
+    required: false
+    default: "0"
+  paths:
+    description: >-
+      Review only pull requests that change a path matching one of these
+      shell patterns (comma- or newline-separated; * also matches /), or
+      whose diff reaches min-diff-bytes. Empty sets no path condition.
+    required: false
+    default: ""
+  max-rounds:
+    description: >-
+      When findings remain after this many review rounds, pause instead of
+      reviewing again, and ask for the approach to be reconsidered; 0 for no
+      cap
+    required: false
+    default: "3"
 
 runs:
   using: composite
@@ -102,7 +163,15 @@ runs:
         VERIFY_LANDED: ${{ inputs.verify-landed }}
         ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
         REVIEW_SCOPE: ${{ inputs.review-scope }}
+        MAX_ROUNDS: ${{ inputs.max-rounds }}
+        MIN_DIFF_BYTES: ${{ inputs.min-diff-bytes }}
         REVIEW_MODEL: ${{ inputs.model }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
+        MAX_NITS: ${{ inputs.max-nits }}
+        INLINE_COMMENTS: ${{ inputs.inline-comments }}
+        FULL_FILES_MAX_BYTES: ${{ inputs.full-files-max-bytes }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
         REVIEW_GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -140,20 +209,23 @@ runs:
         ref: ${{ github.event.pull_request.head.sha }}
         path: .ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
 
-    # Only for review-scope since-last-review: read the head this reviewer
-    # last reviewed from its own sticky comment.
+    # Read the round count, the earlier findings and the last result from
+    # this reviewer's own sticky comment, and for review-scope
+    # since-last-review the head it last reviewed.
     - name: Find this reviewer's last review
       id: last-review
-      if: steps.guard.outputs.skip == 'false' && inputs.review-scope == 'since-last-review'
+      if: steps.guard.outputs.skip == 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
+        REVIEW_SCOPE: ${{ inputs.review-scope }}
       run: "$GITHUB_ACTION_PATH/scripts/last-review.sh"
 
     - name: Build review batches
+      id: prepare
       if: steps.guard.outputs.skip == 'false'
       shell: bash
       env:
@@ -166,16 +238,33 @@ runs:
         FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
         MAX_BATCHES: ${{ inputs.max-batches }}
         CONTEXT_FILE: ${{ inputs.context-file }}
+        REVIEW_FILE: ${{ inputs.review-file }}
         REVIEW_SCOPE: ${{ inputs.review-scope }}
         LAST_REVIEWED_SHA: ${{ steps.last-review.outputs.reviewed-commit }}
         LAST_FULL_REVIEW_SHA: ${{ steps.last-review.outputs.full-review }}
         LAST_REVIEW_RESULT: ${{ steps.last-review.outputs.result }}
         LAST_BASE_REF: ${{ steps.last-review.outputs.base-ref }}
         LAST_MERGE_BASE: ${{ steps.last-review.outputs.merge-base }}
+        STICKY_ROUND: ${{ steps.last-review.outputs.round }}
+        STICKY_LEDGER: ${{ steps.last-review.outputs.ledger }}
+        STICKY_RESULT: ${{ steps.last-review.outputs.last-result }}
+        MAX_ROUNDS: ${{ inputs.max-rounds }}
+        MIN_DIFF_BYTES: ${{ inputs.min-diff-bytes }}
+        PATHS: ${{ inputs.paths }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
 
+    - name: Read the pull request's description
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+      run: "$GITHUB_ACTION_PATH/scripts/pr-context.sh"
+
     - name: Run adversarial review
-      if: steps.guard.outputs.skip == 'false'
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
       shell: bash
       env:
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
@@ -183,10 +272,39 @@ runs:
         REVIEW_MODEL: ${{ inputs.model }}
         REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         CONTEXT_TIER: ${{ inputs.context }}
+        MAX_NITS: ${{ inputs.max-nits }}
+        MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        FULL_FILES_MAX_BYTES: ${{ inputs.full-files-max-bytes }}
       run: "$GITHUB_ACTION_PATH/scripts/run-review.sh"
 
+    # Reads the checkout, so it runs without the Copilot token: the head
+    # version of each file a finding names, what the pull request changes in
+    # it, and where the identifiers the finding names appear.
+    - name: Gather verification evidence
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
+      shell: bash
+      env:
+        REVIEW_REPO_DIR: ${{ github.workspace }}/.ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: >-
+        node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" verify-context
+        "$REVIEW_WORK_DIR" "$REVIEW_REPO_DIR" "$HEAD_SHA"
+
+    - name: Verify findings
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
+      shell: bash
+      env:
+        COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        CONTEXT_TIER: ${{ inputs.context }}
+      run: "$GITHUB_ACTION_PATH/scripts/verify-findings.sh"
+
     - name: Post sticky review comment
-      if: steps.guard.outputs.skip == 'false'
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
       continue-on-error: true
       shell: bash
       env:
@@ -197,19 +315,24 @@ runs:
         RUN_ID: ${{ github.run_id }}
         RUN_ATTEMPT: ${{ github.run_attempt }}
         REVIEW_MODEL: ${{ inputs.model }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        INLINE_COMMENTS: ${{ inputs.inline-comments }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
       run: "$GITHUB_ACTION_PATH/scripts/post-comment.sh"
 
-    - name: Fail when every review call failed
-      if: steps.guard.outputs.skip == 'false'
+    - name: Fail when every review or verification call failed
+      if: steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true'
       shell: bash
       env:
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
       run: "$GITHUB_ACTION_PATH/scripts/check-result.sh"
 
     - name: Verify the review landed on this run's head
-      if: steps.guard.outputs.skip == 'false' && inputs.verify-landed == 'true'
+      if: >-
+        steps.guard.outputs.skip == 'false' && steps.prepare.outputs.skip != 'true' &&
+        inputs.verify-landed == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}

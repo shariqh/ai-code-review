@@ -1,35 +1,14 @@
 #!/usr/bin/env bash
 
-# A reply is clean when it says "No issues found." and nothing else. An empty
-# or whitespace-only reply is not clean: it reviewed nothing.
-is_clean_review() {
-  local file=${1:?review file is required}
-  local stripped
-  local remainder
-  stripped=$(tr -d '[:space:]' < "$file")
-  [ -n "$stripped" ] || return 1
-  remainder=$stripped
-
-  while [ "${remainder#Noissuesfound.}" != "$remainder" ]; do
-    remainder=${remainder#Noissuesfound.}
-  done
-
-  [ -z "$remainder" ] || [ "$remainder" = "Noissuesfound" ]
-}
-
-is_complete_clean_review() {
-  local work_dir=${1:?work directory is required}
-  [ ! -s "$work_dir/overflow.note" ] \
-    && [ ! -s "$work_dir/review.failures" ] \
-    && [ "$(tr -d '[:space:]' < "$work_dir/review.md")" = "Noissuesfound." ]
-}
-
 # A review is complete when nothing was truncated or left out by the batch
-# cap and no review call failed, whatever it found. Only a complete review can
-# be the starting point of a since-last-review run.
+# or verification cap, no review or verification call failed, and the round
+# cap did not pause it, whatever it found. Only a complete review can be the
+# starting point of a since-last-review run.
 is_complete_review() {
   local work_dir=${1:?work directory is required}
-  [ ! -s "$work_dir/overflow.note" ] && [ ! -s "$work_dir/review.failures" ]
+  [ ! -s "$work_dir/overflow.note" ] && [ ! -s "$work_dir/review.failures" ] \
+    && [ ! -s "$work_dir/verify.failures" ] && [ ! -s "$work_dir/verify.overflow" ] \
+    && [ ! -s "$work_dir/scope.paused" ]
 }
 
 # An incremental review with an empty diff: none of the pull request's files
@@ -38,6 +17,39 @@ is_complete_review() {
 is_empty_incremental_review() {
   local work_dir=${1:?work directory is required}
   [ -s "$work_dir/scope.since" ] && [ ! -s "$work_dir/pr.diff" ]
+}
+
+# One Copilot CLI call, for the finder and the verifier alike, so both run
+# with the same restrictions: no tool but report_intent, no built-in MCP
+# servers, no custom instructions, no remote session, and the token kept out
+# of tool environments and redacted from output.
+#
+# usage: copilot_call <prompt file> <model> <effort> <context tier> <reply file> <stderr file>
+copilot_call() {
+  copilot -p "$(cat "$1")" \
+    --model "$2" \
+    --effort "$3" \
+    --context "$4" \
+    --available-tools report_intent \
+    --secret-env-vars=COPILOT_GITHUB_TOKEN \
+    --disable-builtin-mcps \
+    --disallow-temp-dir \
+    --no-ask-user \
+    --no-auto-update \
+    --no-color \
+    --no-custom-instructions \
+    --no-remote \
+    --no-remote-export \
+    --silent \
+    > "$5" 2> "$6"
+}
+
+# The reply without the terminal colour sequences the CLI can print.
+# usage: strip_ansi <input> <output>
+strip_ansi() {
+  local escape_character
+  escape_character=$(printf '\033')
+  sed "s/${escape_character}\\[[0-9;]*m//g" "$1" > "$2"
 }
 
 # The jq filter that lists one reviewer's sticky comment ids: comments by
@@ -124,6 +136,33 @@ sticky_scope_fields() {
       if (coverage == "") coverage = "-"
       if (base == "") base = "- -"
       printf "%s %s %s %s\n", result, full, coverage, base
+    }
+  '
+}
+
+# Print the round count and the ledger of earlier findings recorded in a
+# sticky comment's header as "<round> <ledger>", with "-" for anything
+# missing. post-comment.sh writes both for every review; findings.mjs checks
+# the ledger's content. Like sticky_header_fields, it reads the header only.
+sticky_review_fields() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<!-- ai-code-review-result: / { complete = 1; exit }
+    round == "" && /^<!-- ai-code-review-round: [0-9]+ -->$/ {
+      round = $0
+      sub(/^<!-- ai-code-review-round: /, "", round)
+      sub(/ -->$/, "", round)
+    }
+    ledger == "" && /^<!-- ai-code-review-ledger: [A-Za-z0-9+\/]+=*=* -->$/ {
+      ledger = $0
+      sub(/^<!-- ai-code-review-ledger: /, "", ledger)
+      sub(/ -->$/, "", ledger)
+    }
+    END {
+      if (!complete) { round = ""; ledger = "" }
+      if (round == "") round = "-"
+      if (ledger == "") ledger = "-"
+      printf "%s %s\n", round, ledger
     }
   '
 }

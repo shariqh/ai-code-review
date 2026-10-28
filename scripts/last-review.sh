@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# review-scope since-last-review: find the head this reviewer last reviewed,
-# and hand it to prepare-review.sh as the step outputs reviewed-commit,
-# full-review, result, base-ref and merge-base. With no earlier review an
-# incremental review can build on, it sets no outputs and says why, and
-# prepare-review.sh reviews the whole pull request.
+# Read this reviewer's last review from its sticky comment. For every review
+# scope it hands on, as step outputs, the round count (round), the ledger of
+# earlier findings (ledger) and the last result (last-result), for the round
+# cap and so no finding is reported twice. For review-scope
+# since-last-review it also hands on the head this reviewer last reviewed,
+# as reviewed-commit, full-review, result, base-ref and merge-base. With no
+# earlier review an incremental review can build on, it sets none of those
+# and says why, and prepare-review.sh reviews the whole pull request.
 #
 # The previous head comes from this reviewer's own sticky comment, never from
 # the push event's `before`: a run that a newer push cancelled never reviewed
@@ -21,6 +24,7 @@ set -euo pipefail
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
 
 COMMENT_MARKER=${COMMENT_MARKER:-ai-code-review-sticky}
+REVIEW_SCOPE=${REVIEW_SCOPE:-since-last-review}
 if ! [[ "$COMMENT_MARKER" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "::error::comment-marker may contain only letters, numbers, underscores, and hyphens"
   exit 1
@@ -30,7 +34,9 @@ fi
 source "$GITHUB_ACTION_PATH/scripts/lib.sh"
 
 full_review() {
-  echo "review scope: full review, because $1"
+  if [ "$REVIEW_SCOPE" = since-last-review ]; then
+    echo "review scope: full review, because $1"
+  fi
   exit 0
 }
 
@@ -49,6 +55,25 @@ fi
 read -r reviewed_sha _ _ <<< "$(printf '%s\n' "$sticky_body" | sticky_header_fields)"
 read -r result full_review_sha coverage base_ref merge_base \
   <<< "$(printf '%s\n' "$sticky_body" | sticky_scope_fields)"
+read -r round ledger <<< "$(printf '%s\n' "$sticky_body" | sticky_review_fields)"
+
+# For every scope. findings.mjs checks the ledger's content; here it only has
+# to be one base64 line of bounded length.
+if [[ "$round" =~ ^[0-9]{1,4}$ ]]; then
+  echo "round=$round" >> "$GITHUB_OUTPUT"
+else
+  round=0
+fi
+if [[ "$ledger" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "${#ledger}" -le 24000 ]; then
+  echo "ledger=$ledger" >> "$GITHUB_OUTPUT"
+fi
+if [[ "$result" =~ ^(clean|findings)$ ]]; then
+  echo "last-result=$result" >> "$GITHUB_OUTPUT"
+fi
+echo "last review: round $round, result $result (sticky comment $existing_id)"
+if [ "$REVIEW_SCOPE" != since-last-review ]; then
+  exit 0
+fi
 
 # A sticky written without since-last-review records neither the full review
 # nor the coverage, so it cannot be built on, and neither can one that does

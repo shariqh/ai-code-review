@@ -78,6 +78,21 @@ inputs:
       a missing file is skipped silently.
     required: false
     default: .github/ai-review-context.md
+  review-file:
+    description: >-
+      Repo-relative path to the repository's review guide (what a failure
+      looks like here, paths to skip, decisions taken), injected into the
+      finder's and verifier's prompts. Read from the PR BASE ref like
+      context-file. Empty string disables it; a missing file is skipped.
+    required: false
+    default: REVIEW.md
+  full-files-max-bytes:
+    description: >-
+      Bytes of the head version of the touched files sent with each batch,
+      numbered by line, so the finder can check how changed code is called;
+      0 leaves them out
+    required: false
+    default: "60000"
   comment-marker:
     description: Identifier used for the sticky PR comment
     required: false
@@ -133,6 +148,7 @@ runs:
         MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
         MAX_NITS: ${{ inputs.max-nits }}
         INLINE_COMMENTS: ${{ inputs.inline-comments }}
+        FULL_FILES_MAX_BYTES: ${{ inputs.full-files-max-bytes }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
         REVIEW_GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -196,6 +212,7 @@ runs:
         FILE_MAX_BYTES: ${{ inputs.file-max-bytes }}
         MAX_BATCHES: ${{ inputs.max-batches }}
         CONTEXT_FILE: ${{ inputs.context-file }}
+        REVIEW_FILE: ${{ inputs.review-file }}
         REVIEW_SCOPE: ${{ inputs.review-scope }}
         LAST_REVIEWED_SHA: ${{ steps.last-review.outputs.reviewed-commit }}
         LAST_FULL_REVIEW_SHA: ${{ steps.last-review.outputs.full-review }}
@@ -203,6 +220,16 @@ runs:
         LAST_BASE_REF: ${{ steps.last-review.outputs.base-ref }}
         LAST_MERGE_BASE: ${{ steps.last-review.outputs.merge-base }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
+
+    - name: Read the pull request's description
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+      run: "$GITHUB_ACTION_PATH/scripts/pr-context.sh"
 
     - name: Run adversarial review
       if: steps.guard.outputs.skip == 'false'
@@ -216,6 +243,7 @@ runs:
         MAX_NITS: ${{ inputs.max-nits }}
         MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
         VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        FULL_FILES_MAX_BYTES: ${{ inputs.full-files-max-bytes }}
       run: "$GITHUB_ACTION_PATH/scripts/run-review.sh"
 
     # Reads the checkout, so it runs without the Copilot token: the head

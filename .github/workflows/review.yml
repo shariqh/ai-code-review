@@ -113,6 +113,18 @@ on:
           branch only. An empty string disables it.
         type: string
         default: .github/ai-review-context.md
+      review-file:
+        description: >-
+          Repo-relative review guide (REVIEW.md), read from the base branch
+          only. An empty string disables it.
+        type: string
+        default: REVIEW.md
+      full-files-max-bytes:
+        description: >-
+          Bytes of the head version of the touched files sent with each
+          batch; 0 leaves them out
+        type: number
+        default: 60000
       review-scope:
         description: >-
           full reviews the whole pull request on every run. since-last-review
@@ -197,6 +209,8 @@ jobs:
           max-batches: ${{ inputs.max-batches }}
           owner-only: ${{ inputs.owner-only }}
           context-file: ${{ inputs.context-file }}
+          review-file: ${{ inputs.review-file }}
+          full-files-max-bytes: ${{ inputs.full-files-max-bytes }}
           review-scope: ${{ inputs.review-scope }}
           verify-landed: ${{ inputs.verify-landed }}
           allow-missing-token: ${{ inputs.allow-missing-token }}

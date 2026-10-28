@@ -11,6 +11,10 @@
 //   commentable <diff> <out.json>
 //       {path: [[first, last], ...]}, the new-side line ranges of each hunk,
 //       which are the lines GitHub accepts a review comment on
+//   head-files <work dir> <repo dir> <head sha>
+//       for each batch, batches/batch_NNN.files/NNN.txt: the head version of
+//       each file the batch's diff touches, numbered by line, whole or the
+//       window around its first change, for the finder
 //   verify-context <work dir> <repo dir> <head sha>
 //       for each finding findings.json marks for verification, the directory
 //       verify/<id>/ with finding.txt, file.txt (the head version of the file
@@ -18,11 +22,12 @@
 //       changes in that file, from pr-full.diff) and references.txt (where
 //       the identifiers it names appear at the head commit)
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const FILE_MAX_BYTES = 48000;
+const HEAD_FILE_MAX_BYTES = 40000;
 const BLOB_READ_MAX_BYTES = 8 * 1024 * 1024;
 const CHANGES_MAX_BYTES = 12000;
 const REFERENCES_MAX_BYTES = 6000;
@@ -225,6 +230,47 @@ export function references(repoDir, head, names) {
   return sections.length > 0 ? `${sections.join("\n\n")}\n` : "The finding names no identifier to look up.\n";
 }
 
+function firstChangedLine(fragment) {
+  const match = /^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)/m.exec(fragment.text);
+  return match ? Number(match[1]) : 1;
+}
+
+// A file section for the finder's prompt. Every content line starts with its
+// number, so no line of the file can pass for the section's end marker.
+function fileSection(path, window) {
+  const extent = window.first === 1 && window.last === window.total
+    ? `all ${window.total} lines`
+    : `lines ${window.first} to ${window.last} of ${window.total}`;
+  return `--- BEGIN FILE ${JSON.stringify(path)} (head version, ${extent}) ---\n${window.text}--- END FILE ---\n`;
+}
+
+export function headFiles(workDir, repoDir, head) {
+  if (!/^[0-9a-f]{40}$/.test(head)) throw new Error("the head must be a full commit SHA");
+  const batchesDir = join(workDir, "batches");
+  if (!existsSync(batchesDir)) return 0;
+  let written = 0;
+  for (const name of readdirSync(batchesDir).filter((entry) => /^batch_[0-9]+\.diff$/.test(entry)).sort()) {
+    const dir = join(batchesDir, name.replace(/\.diff$/, ".files"));
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const seen = new Set();
+    let index = 0;
+    for (const fragment of splitDiff(readFileSync(join(batchesDir, name), "utf8"))) {
+      const path = fragment.newPath;
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      const file = headFile(repoDir, head, path);
+      const section = file.kind === "file"
+        ? fileSection(path, numberedWindow(file.text, firstChangedLine(fragment), HEAD_FILE_MAX_BYTES))
+        : `--- FILE ${JSON.stringify(path)} not shown: ${file.note} ---\n`;
+      writeFileSync(join(dir, `${String(index).padStart(3, "0")}.txt`), section);
+      index += 1;
+      written += 1;
+    }
+  }
+  return written;
+}
+
 function findingText(finding) {
   const where = finding.path
     ? `${finding.path}${finding.line ? `:${finding.line}${finding.end_line ? `-${finding.end_line}` : ""}` : ""}`
@@ -284,6 +330,15 @@ function main(argv) {
       writeFileSync(outPath, `${JSON.stringify(commentableLines(readFileSync(diffPath, "utf8")))}\n`);
       return 0;
     }
+    case "head-files": {
+      const [workDir, repoDir, head] = args;
+      if (!workDir || !repoDir || !head) {
+        throw new Error("usage: review-files.mjs head-files <work dir> <repo dir> <head sha>");
+      }
+      const count = headFiles(workDir, repoDir, head);
+      console.log(`head versions gathered for ${count} ${count === 1 ? "file" : "files"}`);
+      return 0;
+    }
     case "verify-context": {
       const [workDir, repoDir, head] = args;
       if (!workDir || !repoDir || !head) {
@@ -294,7 +349,7 @@ function main(argv) {
       return 0;
     }
     default:
-      throw new Error("usage: review-files.mjs commentable|verify-context ...");
+      throw new Error("usage: review-files.mjs commentable|head-files|verify-context ...");
   }
 }
 

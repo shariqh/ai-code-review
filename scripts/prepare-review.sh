@@ -30,6 +30,7 @@ mkdir -p "$REVIEW_WORK_DIR"
 # trusted — only maintainers can move it — and always current. Fall back to
 # BASE_SHA when the remote ref is absent (e.g. plain-SHA test fixtures).
 CONTEXT_FILE=${CONTEXT_FILE:-}
+REVIEW_FILE=${REVIEW_FILE:-}
 CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES:-16000}
 BASE_REF=${BASE_REF:-}
 context_rev="$BASE_SHA"
@@ -38,26 +39,36 @@ if [ -n "$BASE_REF" ] && \
       "refs/remotes/origin/$BASE_REF" > /dev/null; then
   context_rev="refs/remotes/origin/$BASE_REF"
 fi
-: > "$REVIEW_WORK_DIR/review-context.md"
-if [ -n "$CONTEXT_FILE" ]; then
-  if git -C "$REVIEW_REPO_DIR" show "$context_rev:$CONTEXT_FILE" \
-      > "$REVIEW_WORK_DIR/review-context.md" 2>/dev/null; then
-    context_bytes=$(wc -c < "$REVIEW_WORK_DIR/review-context.md")
-    if [ "$context_bytes" -gt "$CONTEXT_MAX_BYTES" ]; then
-      head -c "$CONTEXT_MAX_BYTES" "$REVIEW_WORK_DIR/review-context.md" \
-        > "$REVIEW_WORK_DIR/review-context.md.tmp"
-      printf '\n[review context truncated at %s bytes]\n' "$CONTEXT_MAX_BYTES" \
-        >> "$REVIEW_WORK_DIR/review-context.md.tmp"
-      mv "$REVIEW_WORK_DIR/review-context.md.tmp" "$REVIEW_WORK_DIR/review-context.md"
+
+# Writes the base revision's copy of <file> to <out>, cut at
+# CONTEXT_MAX_BYTES with a note; <out> is empty when <file> is empty or not
+# on the base.
+# usage: read_base_file <label> <file> <out>
+read_base_file() {
+  local label=$1 file=$2 out=$3 bytes
+  : > "$out"
+  [ -n "$file" ] || return 0
+  if git -C "$REVIEW_REPO_DIR" show "$context_rev:$file" > "$out" 2>/dev/null; then
+    bytes=$(wc -c < "$out")
+    if [ "$bytes" -gt "$CONTEXT_MAX_BYTES" ]; then
+      head -c "$CONTEXT_MAX_BYTES" "$out" > "$out.tmp"
+      printf '\n[%s truncated at %s bytes]\n' "$label" "$CONTEXT_MAX_BYTES" >> "$out.tmp"
+      mv "$out.tmp" "$out"
     fi
-    echo "review context: $CONTEXT_FILE ($context_bytes bytes from $context_rev)"
+    echo "$label: $file ($bytes bytes from $context_rev)"
   else
-    # Not on the base ref (or unreadable) — review without context. A partial
+    # Not on the base ref (or unreadable) — review without it. A partial
     # write from the failed `git show` must not leak into the prompt.
-    : > "$REVIEW_WORK_DIR/review-context.md"
-    echo "review context: $CONTEXT_FILE not on $context_rev; skipping"
+    : > "$out"
+    echo "$label: $file not on $context_rev; skipping"
   fi
-fi
+}
+
+read_base_file "review context" "$CONTEXT_FILE" "$REVIEW_WORK_DIR/review-context.md"
+# The repository's review guide (REVIEW.md by default): what failure looks
+# like in this repository, paths to skip, decisions already taken. Read from
+# the base branch for the same reason as the review context.
+read_base_file "review guide" "$REVIEW_FILE" "$REVIEW_WORK_DIR/review-guide.md"
 
 # review-scope since-last-review: write the diff of the commits since the head
 # this reviewer last reviewed (LAST_REVIEWED_SHA, found by last-review.sh),
@@ -224,3 +235,9 @@ fi
 "$GITHUB_ACTION_PATH/scripts/chunk-diff.sh" \
   "$REVIEW_WORK_DIR/pr.diff" \
   "$REVIEW_WORK_DIR"
+
+# The head version of each file a batch touches, numbered by line, so the
+# finder can see how the changed code is called and defined rather than
+# guess. Read from the head commit's objects, never the working tree.
+node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" head-files \
+  "$REVIEW_WORK_DIR" "$REVIEW_REPO_DIR" "$HEAD_SHA"

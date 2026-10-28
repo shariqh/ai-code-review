@@ -121,6 +121,8 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `max-batches` | `8` | Maximum finder calls per reviewer |
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context (base branch only; empty disables) |
+| `review-file` | `REVIEW.md` | Repository review guide (base branch only; empty disables) |
+| `full-files-max-bytes` | `60000` | Bytes of the touched files' head versions sent with each batch; `0` leaves them out |
 | `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since each reviewer's last complete review |
 
 The only secret is `COPILOT_REVIEW_PAT`. Without it, a reviewer job on an
@@ -226,10 +228,45 @@ be present.
 | `max-batches` | `8` | Maximum finder calls |
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context injected into the prompt (base ref only; empty disables) |
+| `review-file` | `REVIEW.md` | Repository review guide injected into the prompts (base ref only; empty disables) |
+| `full-files-max-bytes` | `60000` | Bytes of the touched files' head versions sent with each batch; `0` leaves them out |
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
 | `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
 | `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since this reviewer's last complete review |
+
+## What the finder sees
+
+The diff is what is under review, but the finder no longer sees only the
+diff. Each batch's prompt carries, in this order:
+
+1. the repository's review guide (`review-file`) and maintainer review
+   context (`context-file`), both trusted and read from the base branch (see
+   [Repository review context](#repository-review-context));
+2. the pull request's title and description, and up to two issues it closes
+   (`Closes #12`) or its title names (`(#12, part 1)`), read with the
+   `github-token`;
+3. for an incremental review, the files the whole pull request changes;
+4. the batch's diff;
+5. the head version of each file in the batch, numbered by line, so the
+   finder can check how changed code is called and defined instead of
+   guessing: whole files while they fit in `full-files-max-bytes` (60,000
+   bytes by default), the 40 KB around a large file's first change, and a
+   one-line note for a binary file, a submodule or a symbolic link, which is
+   never followed.
+
+The prompt asks the finder to take a trade-off the description records as
+decided, or work it says lands in another pull request, as settled, and to
+look for callers in the files before it calls code unused or not wired in.
+Everything from the pull request, its description and linked issues
+included, is marked as untrusted data, with every line prefixed so none can
+end its section early.
+
+The Copilot CLI takes the prompt as a single command-line argument, which
+Linux caps at 128 KiB, so a prompt is never larger than 130,000 bytes: the
+head files take what is left, whole files only, and a batch whose prompt is
+over the limit without them is not sent and is listed as not reviewed. A
+description over 6,000 bytes, or an issue over 3,000, is cut with a note.
 
 ## Findings and verification
 
@@ -256,7 +293,8 @@ Each finding then goes to the verifier (`verifier-model`, by default
 gather from the head commit: the file it names, numbered by line (the whole
 file, or the 48 KB around the cited line), what the pull request changes in
 that file, and where the identifiers the finding names appear in the
-repository, from `git grep`. It answers `CONFIRMED` or `REFUTED` with a
+repository, from `git grep`, along with the pull request's description and
+the repository's review guide and context. It answers `CONFIRMED` or `REFUTED` with a
 one-line reason, and is told to refute a finding the evidence contradicts,
 such as code called unused that has a caller. At most `max-verifications`
 findings are verified per run, Important first.
@@ -304,20 +342,24 @@ that reviewer to a model the seat offers.
 
 ## Repository review context
 
-The reviewer sees only the diff, so repository conventions it cannot know
-about (theming contracts, intentional patterns) surface as recurring false
-positives. To teach it, commit a `context-file` (default
-`.github/ai-review-context.md`) on the default branch describing those
-conventions and known false positives. When present, its content is injected
-into the prompt as trusted maintainer guidance, ahead of the untrusted diff.
+Repository conventions the reviewer cannot know about (theming contracts,
+intentional patterns) surface as recurring false positives. To teach it,
+commit a `context-file` (default `.github/ai-review-context.md`) on the
+default branch describing those conventions and known false positives, and a
+review guide, `review-file` (default `REVIEW.md`), that says what a failure
+looks like in this repository, which paths to skip and which decisions are
+already taken. When present, each is injected into the finder's and the
+verifier's prompts as trusted maintainer guidance, ahead of the untrusted
+diff. The scripts do not parse either file; the nit cap is the `max-nits`
+input.
 
 The file is read from the **current tip of the PR's base branch** via
 `git show` (falling back to the event's base SHA if the remote ref is
 unavailable), never from the PR head or the checked-out working tree, so a
-pull request cannot rewrite the instructions that review it — edits to the
-context file take effect only after they land on the base branch, and then
-apply to already-open PRs on their next review. Content beyond 16 KB is
-truncated with a note.
+pull request cannot rewrite the instructions that review it — edits to
+either file take effect only after they land on the base branch, and then
+apply to already-open PRs on their next review. Content beyond 16 KB in
+either file is truncated with a note.
 
 ## Incremental reviews
 
@@ -407,9 +449,14 @@ review too, and later runs build on it.
 - PR contents are checked out into an isolated subdirectory and removed after
   the review, including on persistent self-hosted runners.
 - Copilot receives the diff inline and loads no repository instructions,
-  except the maintainer `context-file`, which is read from the base branch
-  only — never from the PR head — so PRs cannot influence their own review
-  prompt.
+  except the maintainer `context-file` and `review-file`, which are read from
+  the base branch only — never from the PR head — so PRs cannot influence
+  their own review instructions. The head versions of the touched files are
+  read from the head commit's objects, not the working tree, and, like the
+  pull request's title, description and linked issues, are marked as
+  untrusted data. The description and issues are read with the
+  `github-token`; an issue it cannot read is left out and the log says so
+  (the reusable workflow does not request the `issues` permission).
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and
   GitHub tools are unavailable. The verifier runs with the same restrictions
   (`copilot_call` in `scripts/lib.sh`). Its evidence is gathered by

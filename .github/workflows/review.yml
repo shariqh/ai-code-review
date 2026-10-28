@@ -20,14 +20,13 @@ on:
         default: ubuntu-latest
       reviewers:
         description: >-
-          JSON array with one entry per reviewer. Each entry needs a model and
+          JSON array with one entry per reviewer (Astra alone by default). Each entry needs a model and
           a marker that no other reviewer uses, and may set name (the job
           name, defaulting to the model), timeout-minutes, reasoning-effort
           and context.
         type: string
         default: >-
-          [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"},
-          {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
+          [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
           "timeout-minutes": 40}]
       timeout-minutes:
         description: Job timeout for reviewers that do not set their own

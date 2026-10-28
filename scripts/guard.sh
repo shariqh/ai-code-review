@@ -68,7 +68,8 @@ case "${VERIFIER_EFFORT:-low}" in
 esac
 
 for setting in "max-verifications=${MAX_VERIFICATIONS:-10}" "max-nits=${MAX_NITS:-3}" \
-  "full-files-max-bytes=${FULL_FILES_MAX_BYTES:-60000}" "max-rounds=${MAX_ROUNDS:-3}"; do
+  "full-files-max-bytes=${FULL_FILES_MAX_BYTES:-60000}" "max-rounds=${MAX_ROUNDS:-3}" \
+  "min-diff-bytes=${MIN_DIFF_BYTES:-0}"; do
   if ! [[ "${setting#*=}" =~ ^[0-9]+$ ]]; then
     echo "::error::${setting%%=*} must be a non-negative integer"
     exit 1

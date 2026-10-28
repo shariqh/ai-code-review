@@ -212,7 +212,8 @@ guard_errors="$TEMP_DIR/guard.err"
 for bad_setting in REVIEW_MODEL= 'REVIEW_MODEL=gpt 5' \
   COMMENT_MARKER= 'COMMENT_MARKER=bad marker' VERIFY_LANDED=yes \
   ALLOW_MISSING_TOKEN=yes REVIEW_SCOPE=sometimes 'VERIFIER_MODEL=gpt 5' \
-  VERIFIER_EFFORT=extreme MAX_VERIFICATIONS=-1 MAX_NITS=x INLINE_COMMENTS=yes; do
+  VERIFIER_EFFORT=extreme MAX_VERIFICATIONS=-1 MAX_NITS=x INLINE_COMMENTS=yes \
+  FULL_FILES_MAX_BYTES=many MAX_ROUNDS=three MIN_DIFF_BYTES=1e6; do
   if run_guard "$bad_setting" PR_DRAFT=true > "$guard_errors" 2>&1; then
     fail "guard accepted $bad_setting"
   fi
@@ -1344,6 +1345,34 @@ done
 diff_line=$(grep -n -- '^--- BEGIN DIFF ---$' "$verified_work/prompt.txt" | cut -d: -f1)
 [ "$desc_line" -lt "$diff_line" ] || fail "the description must precede the diff"
 
+# A reviewer limited to large or sensitive pull requests (min-diff-bytes,
+# paths) skips, with a notice and the step output skip=true, a pull request
+# that is neither; either condition is enough to review.
+# usage: gate <expected skip> <message> [NAME=value]...
+gate() {
+  local expected=$1 message=$2 work="$TEMP_DIR/gate-work"
+  shift 2
+  rm -rf "$work"
+  : > "$TEMP_DIR/gate.out"
+  env BASE_SHA="$verify_base" HEAD_SHA="$verify_head_sha" REVIEW_REPO_DIR="$verify_repo" \
+    REVIEW_WORK_DIR="$work" GITHUB_ACTION_PATH="$ROOT" GITHUB_OUTPUT="$TEMP_DIR/gate.out" "$@" \
+    "$ROOT/scripts/prepare-review.sh" > "$TEMP_DIR/gate.log" 2>&1 \
+    || fail "prepare-review.sh failed: $(cat "$TEMP_DIR/gate.log")"
+  [ "$(cat "$TEMP_DIR/gate.out")" = "skip=$expected" ] \
+    || fail "expected skip=$expected with $*, got: $(cat "$TEMP_DIR/gate.out")"
+  assert_contains "$TEMP_DIR/gate.log" "$message"
+  if [ "$expected" = true ] && [ -e "$work/batch.count" ]; then
+    fail "a skipped reviewer built batches"
+  fi
+}
+gate true "this one does neither, so it is skipped" MIN_DIFF_BYTES=1000000
+gate true "this one does neither, so it is skipped" 'PATHS=docs/*, billing/*'
+gate false "met, because its diff is" MIN_DIFF_BYTES=10 'PATHS=docs/*'
+gate false "met, because it changes caller.js, which matches caller.*" \
+  MIN_DIFF_BYTES=1000000 'PATHS=docs/*, caller.*'
+gate false "met, because it changes app.js, which matches *.js" "PATHS=$(printf 'docs/*\n*.js')"
+gate false "diff bytes:" MIN_DIFF_BYTES=0 PATHS=
+
 # A finder reply that does not follow the format is a failed call: its files
 # count as not reviewed, and the reply is kept below the fold.
 printf '%s\n' '### HIGH' 'Something is wrong in app.js.' > "$TEMP_DIR/unstructured-reply.md"
@@ -2141,9 +2170,22 @@ assert_contains "$workflow" "max-rounds: \${{ inputs.max-rounds }}"
 # The no-token smoke jobs opt out explicitly; without that they would fail.
 [ "$(grep -c 'allow-missing-token: true' "$ROOT/.github/workflows/test.yml")" = "2" ] \
   || fail "both no-token smoke jobs must set allow-missing-token"
+# The default is Sol alone, on the marker it had as a second reviewer, and
+# the verifier is not a Claude model either: it decides what is posted on
+# Claude-authored code.
 default_models=$(node "$ROOT/tests/check-default-reviewers.mjs" "$workflow")
-[ "$default_models" = "gpt-6-astra" ] \
+[ "$default_models" = "gpt-5.6-sol" ] \
   || fail "unexpected default reviewers: $default_models"
+assert_contains "$workflow" '[{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky",'
+for file in "$ROOT/action.yml" "$workflow"; do
+  verifier_default=$(grep -A8 -E '^ {2,6}verifier-model:$' "$file" | grep -m1 -E '^ +default: ' \
+    | sed -E 's/^ +default: //')
+  [ "$verifier_default" = gpt-5.6-sol ] || fail "unexpected default verifier in $file: $verifier_default"
+done
+# Every step after the batches are built honours the reviewer conditions
+# (min-diff-bytes, paths), except the cleanup.
+[ "$(grep -c "steps.prepare.outputs.skip != 'true'" "$ROOT/action.yml")" = 7 ] \
+  || fail "every step after the batches are built must skip when the reviewer's conditions are not met"
 assert_contains "$ROOT/examples/reusable-workflow.yml" "pull_request_target:"
 assert_contains "$ROOT/examples/reusable-workflow.yml" \
   "COPILOT_REVIEW_PAT: \${{ secrets.COPILOT_REVIEW_PAT }}"

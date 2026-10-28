@@ -20,14 +20,16 @@ on:
         default: ubuntu-latest
       reviewers:
         description: >-
-          JSON array with one entry per reviewer (Astra alone by default). Each entry needs a model and
-          a marker that no other reviewer uses, and may set name (the job
-          name, defaulting to the model), timeout-minutes, reasoning-effort,
-          context, verifier-model and verifier-effort.
+          JSON array with one entry per reviewer (Sol alone by default). Each
+          entry needs a model and a marker that no other reviewer uses, and
+          may set name (the job name, defaulting to the model),
+          timeout-minutes, reasoning-effort, context, verifier-model,
+          verifier-effort, and min-diff-bytes and paths to review only large
+          or sensitive pull requests.
         type: string
         default: >-
-          [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
-          "timeout-minutes": 40}]
+          [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky",
+          "timeout-minutes": 30}]
       timeout-minutes:
         description: Job timeout for reviewers that do not set their own
         type: number
@@ -205,6 +207,8 @@ jobs:
           context: ${{ matrix.reviewer.context || inputs.context }}
           verifier-model: ${{ matrix.reviewer.verifier-model || inputs.verifier-model }}
           verifier-effort: ${{ matrix.reviewer.verifier-effort || inputs.verifier-effort }}
+          min-diff-bytes: ${{ matrix.reviewer.min-diff-bytes || 0 }}
+          paths: ${{ matrix.reviewer.paths || '' }}
           max-verifications: ${{ inputs.max-verifications }}
           max-nits: ${{ inputs.max-nits }}
           inline-comments: ${{ inputs.inline-comments }}

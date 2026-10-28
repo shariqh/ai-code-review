@@ -9,9 +9,9 @@ comments (see [Findings and verification](#findings-and-verification)).
 It comes in two forms:
 
 - a **reusable workflow** (`.github/workflows/review.yml`) that runs one or
-  more reviewers in parallel, by default just `gpt-6-astra`, and
-  fails a reviewer's job when its review did not land on the PR's current
-  head;
+  more reviewers in parallel, by default just `gpt-5.6-sol` with
+  `gpt-5.6-sol` at low effort as its verifier, and fails a reviewer's job
+  when its review did not land on the PR's current head;
 - the **composite action** (`action.yml`) it is built on, for a single
   reviewer in a job you write yourself.
 
@@ -48,7 +48,7 @@ review checks out the PR head only as data and never executes repository code.
 Pin the call to a release commit SHA:
 
 ```yaml
-uses: shariqh/ai-code-review/.github/workflows/review.yml@<commit-sha> # v1.4.0
+uses: shariqh/ai-code-review/.github/workflows/review.yml@<commit-sha> # v1.5.0
 ```
 
 Each reviewer job checks out this repository at the commit it was called at
@@ -76,24 +76,39 @@ not stop the others.
 | `context` | no | Overrides the `context` input |
 | `verifier-model` | no | Overrides the `verifier-model` input |
 | `verifier-effort` | no | Overrides the `verifier-effort` input |
+| `min-diff-bytes` | no | Review only pull requests whose whole diff is at least this many bytes, or that match `paths` |
+| `paths` | no | Review only pull requests that change a path matching one of these shell patterns (comma-separated; `*` also matches `/`), or that reach `min-diff-bytes` |
 
-The default is one reviewer, Astra:
+The default is one reviewer, Sol, whose findings `gpt-5.6-sol` verifies at
+low effort before they are posted:
 
 ```json
 [
-  {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra", "timeout-minutes": 40}
+  {"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky", "timeout-minutes": 30}
 ]
 ```
 
+Sol keeps the marker it had as a second reviewer, so its existing comment
+carries over. A repository that relied on the earlier default, Astra alone,
+gets a new Sol comment; its last Astra comment stays as it was.
+
 To run a second reviewer, pass the full list through `reviewers`, keeping the
-default entry and adding another, for example Sol:
+default entry and adding another. A reviewer with `min-diff-bytes` or
+`paths` reviews only pull requests that are that large or change those
+paths, and otherwise skips with a notice and a green job, for example Astra
+for large diffs and sensitive paths:
 
 ```yaml
 with:
   reviewers: >-
-    [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra", "timeout-minutes": 40},
-    {"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"}]
+    [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky", "timeout-minutes": 30},
+    {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra", "timeout-minutes": 40,
+     "min-diff-bytes": 150000, "paths": "src/billing/*,src/auth/*"}]
 ```
+
+The conditions are checked against the whole pull request, not the commits
+since the last review, so a reviewer that started reviewing a pull request
+keeps reviewing it.
 
 Keep the reviewers non-Claude when they review Claude-authored code; an
 independent model is the point of the outside opinion. GitHub names each
@@ -104,7 +119,7 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `runs-on` | `ubuntu-latest` | Runner label, or JSON such as `["self-hosted","copilot-review"]` |
-| `reviewers` | Astra alone (above) | Reviewer list |
+| `reviewers` | Sol alone (above) | Reviewer list |
 | `timeout-minutes` | `20` | Job timeout for reviewers without their own |
 | `cancel-in-progress` | `false` | Cancel a reviewer's running job when a newer push arrives |
 | `verify-landed` | `true` | Fail a job whose sticky comment does not cover the current head from this run attempt |
@@ -238,6 +253,8 @@ be present.
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
 | `review-scope` | `since-last-review` | Review each pull request in full once, then only the commits since this reviewer's last complete review; `full` reviews it whole every time |
 | `max-rounds` | `3` | Pause after this many rounds that left findings; `0` for no cap |
+| `min-diff-bytes` | `0` | Review only pull requests whose whole diff is at least this many bytes, or that match `paths`; `0` sets no size condition |
+| `paths` | empty | Review only pull requests that change a path matching one of these shell patterns (comma- or newline-separated; `*` also matches `/`), or that reach `min-diff-bytes` |
 
 ## What the finder sees
 

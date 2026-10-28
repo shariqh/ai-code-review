@@ -19,14 +19,14 @@ jobs:
     # Pin to a release commit SHA once the pilot works. The reviewer jobs run
     # the action from the same commit, so the pin covers both.
     uses: shariqh/ai-code-review/.github/workflows/review.yml@main
-    # Optional: a self-hosted lane, a second reviewer (the default is Astra alone), and later rounds
-    # that review only the commits since each reviewer's last review.
+    # Optional: a self-hosted lane, and a second reviewer that reviews only large or sensitive
+    # pull requests. The default is Sol alone, each finding checked by a verifier call.
     # with:
     #   runs-on: '["self-hosted","copilot-review"]'
-    #   review-scope: since-last-review
     #   reviewers: >-
-    #     [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
-    #     "timeout-minutes": 40},
-    #     {"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"}]
+    #     [{"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky",
+    #     "timeout-minutes": 30},
+    #     {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
+    #     "timeout-minutes": 40, "min-diff-bytes": 150000, "paths": "src/billing/*,src/auth/*"}]
     secrets:
       COPILOT_REVIEW_PAT: ${{ secrets.COPILOT_REVIEW_PAT }}

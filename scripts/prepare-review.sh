@@ -249,6 +249,54 @@ else
   rm -f "$REVIEW_WORK_DIR/commentable.json"
 fi
 
+# A reviewer can be limited to large or sensitive pull requests: it reviews
+# only when the pull request's whole diff is at least MIN_DIFF_BYTES, or it
+# changes a path that matches one of PATHS (shell patterns, separated by
+# commas or newlines, in which * also matches /). Otherwise the step output
+# skip is true and the later steps do nothing. With neither set, every pull
+# request is reviewed. When the paths cannot be listed, it reviews.
+MIN_DIFF_BYTES=${MIN_DIFF_BYTES:-0}
+if ! [[ "$MIN_DIFF_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "::error::min-diff-bytes must be a non-negative integer"
+  exit 1
+fi
+patterns=()
+IFS=$',\n' read -r -d '' -a raw_patterns <<< "${PATHS:-}" || true
+for pattern in ${raw_patterns[@]+"${raw_patterns[@]}"}; do
+  pattern=$(printf '%s' "$pattern" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$pattern" ] && patterns+=("$pattern")
+done
+if [ "$MIN_DIFF_BYTES" -gt 0 ] || [ "${#patterns[@]}" -gt 0 ]; then
+  gate_reason=""
+  full_bytes=$(wc -c < "$REVIEW_WORK_DIR/pr-full.diff" | tr -d '[:space:]')
+  if [ "$MIN_DIFF_BYTES" -gt 0 ] && [ "$full_bytes" -ge "$MIN_DIFF_BYTES" ]; then
+    gate_reason="its diff is $full_bytes bytes, at least min-diff-bytes ($MIN_DIFF_BYTES)"
+  fi
+  if [ -z "$gate_reason" ] && [ "${#patterns[@]}" -gt 0 ]; then
+    if git -C "$REVIEW_REPO_DIR" diff --name-only -z "$context_rev...$HEAD_SHA" \
+        > "$REVIEW_WORK_DIR/gate.paths"; then
+      while IFS= read -r -d '' path && [ -z "$gate_reason" ]; do
+        for pattern in "${patterns[@]}"; do
+          # shellcheck disable=SC2053 # the pattern is a glob on purpose
+          if [[ "$path" == $pattern ]]; then
+            gate_reason="it changes $path, which matches $pattern"
+            break
+          fi
+        done
+      done < "$REVIEW_WORK_DIR/gate.paths"
+    else
+      gate_reason="its paths could not be listed"
+    fi
+  fi
+  if [ -z "$gate_reason" ]; then
+    echo "::notice::This reviewer reviews only pull requests whose diff is at least ${MIN_DIFF_BYTES} bytes (0 means no size condition) or that change a path matching '${PATHS:-}'; this one does neither, so it is skipped."
+    echo "skip=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+    exit 0
+  fi
+  echo "reviewer conditions: met, because $gate_reason"
+fi
+echo "skip=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+
 # Paused: the last review was round MAX_ROUNDS or later and left findings,
 # and there is something new to review. No model is called; the comment says
 # the new commits were not reviewed and asks for the approach to be

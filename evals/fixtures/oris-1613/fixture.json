@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "oris-1613",
+  "repository": "shariqh/oris",
+  "private": true,
+  "pull_request": 1613,
+  "base": "a5d58c0a9f7d86a873f667f4d5a6310aa6bad636",
+  "head": "8ae8caeb61b8b551238e349ac2c38f6f1b5fe07d",
+  "source": "Round 2 of the oris sample in shariqh/ai-code-review#9 and dev-setup #26.",
+  "expectations": [
+    {
+      "id": "false-positive-stacked-pr",
+      "kind": "false-positive",
+      "class": "stacked-pr",
+      "note": "Sol, two rounds running: event types reported as unhandled, though the description says the stacked part 2 adds them.",
+      "locations": [
+        {"path_sha256": "e9a7e265a565bf0f47082134cf0b48c1cf44aed56c75aab8501a6a13e32d916f", "lines": [650, 707]},
+        {"path_sha256": "e9a7e265a565bf0f47082134cf0b48c1cf44aed56c75aab8501a6a13e32d916f", "lines": [954, 982]}
+      ]
+    }
+  ]
+}

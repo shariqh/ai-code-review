@@ -16,7 +16,7 @@ fail() {
   exit 1
 }
 
-for script in "$ROOT"/scripts/*.sh; do
+for script in "$ROOT"/scripts/*.sh "$ROOT"/evals/*.sh; do
   bash -n "$script" || fail "$script has a syntax error"
 done
 
@@ -1372,6 +1372,99 @@ gate false "met, because it changes caller.js, which matches caller.*" \
   MIN_DIFF_BYTES=1000000 'PATHS=docs/*, caller.*'
 gate false "met, because it changes app.js, which matches *.js" "PATHS=$(printf 'docs/*\n*.js')"
 gate false "diff bytes:" MIN_DIFF_BYTES=0 PATHS=
+
+# Evals. A fixture from a private repository holds no path, code or finding
+# text from it: only SHAs, hashed paths, line ranges, classes and keywords.
+for fixture_file in "$ROOT"/evals/fixtures/*/fixture.json; do
+  node -e '
+    const f = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    const dir = require("path").basename(require("path").dirname(process.argv[1]));
+    const ok = f.version === 1 && f.id === dir && /^[\w.-]+\/[\w.-]+$/.test(f.repository)
+      && Number.isInteger(f.pull_request) && /^[0-9a-f]{40}$/.test(f.base) && /^[0-9a-f]{40}$/.test(f.head)
+      && Array.isArray(f.expectations) && f.expectations.length > 0
+      && f.expectations.every((e) => ["real-catch", "false-positive"].includes(e.kind)
+        && typeof e.id === "string" && typeof e.note === "string" && !("path" in e)
+        && (e.locations ?? []).every((l) => /^[0-9a-f]{64}$/.test(l.path_sha256) && !("path" in l)));
+    const privateText = f.private ? f.expectations.map((e) => e.note).join(" ") : "";
+    if (!ok || /[\/`]/.test(privateText)) { console.error("malformed or leaking fixture: " + dir); process.exit(1); }
+  ' "$fixture_file" || fail "$fixture_file is malformed or holds a path"
+done
+
+# The scorer: a real catch needs a posted finding at its location; a false
+# positive passes when it is refuted or not reported, and fails when posted.
+eval_dir="$TEMP_DIR/eval"
+mkdir -p "$eval_dir"
+app_hash=$(printf '%s' app.js | node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(0)).digest("hex"))')
+jq -n --arg hash "$app_hash" --arg base "$verify_base" --arg head "$verify_head_sha" '{
+  version: 1, id: "local", repository: "shariqh/example", private: false, pull_request: 7,
+  base: $base, head: $head, source: "test",
+  expectations: [
+    {id: "catch", kind: "real-catch", note: "the unchecked index", severity: ["Important"],
+     keywords: ["bound", "unchecked"], locations: [{path_sha256: $hash, lines: [15, 15]}]},
+    {id: "not-wired", kind: "false-positive", class: "not-wired", note: "it is called",
+     locations: [{path_sha256: $hash}]}
+  ]}' > "$eval_dir/fixture.json"
+# usage: score_case <expected exit> <verdict of the catch> <verdict of the dead-code claim> [line]
+score_case() {
+  jq -n --arg catch "$2" --arg wired "$3" --argjson line "${4:-15}" '{findings: [
+    {id: "F1", severity: "Important", path: "app.js", line: $line, title: "Unchecked index",
+     issue: "No bound check.", impact: "", fix: "", verdict: $catch},
+    {id: "F2", severity: "Important", path: "app.js", line: 14,
+     title: "`openThing` is never wired in", issue: "", impact: "", fix: "", verdict: $wired}]}' \
+    > "$eval_dir/review.json"
+  local status=0
+  node "$ROOT/evals/score.mjs" "$eval_dir/fixture.json" "$eval_dir/review.json" \
+    > "$eval_dir/score.out" || status=$?
+  [ "$status" = "$1" ] || fail "expected score exit $1 for $2/$3: $(cat "$eval_dir/score.out")"
+}
+score_case 0 confirmed refuted
+assert_contains "$eval_dir/score.out" "PASS local catch (real-catch): posted F1 (Important, line 15)"
+assert_contains "$eval_dir/score.out" "PASS local not-wired (false-positive): no posted finding matches"
+score_case 1 refuted refuted
+assert_contains "$eval_dir/score.out" "FAIL local catch (real-catch)"
+score_case 1 confirmed confirmed
+assert_contains "$eval_dir/score.out" "FAIL local not-wired (false-positive): posted F2 (Important, line 14)"
+score_case 0 skipped unverified 24
+score_case 1 confirmed refuted 26
+
+# The tally: answers by id from review-response comments, across pages and
+# pull requests; a later answer replaces an earlier one, and other comments
+# and lines are ignored.
+comment_json() {
+  jq -cn --arg body "$3" --arg pr "$1" --arg at "$2" \
+    '{user: {login: "shariqh"}, created_at: $at, body: $body,
+      issue_url: ("https://api.github.com/repos/shariqh/example/issues/" + $pr)}'
+}
+{
+  printf '[%s,%s]\n' \
+    "$(comment_json 7 2026-10-01T00:00:00Z "$(printf 'review-response\r\nSol F1 wrong: helper() is called at app.ts:177\n- F2 fixed\nThanks!')")" \
+    "$(comment_json 7 2026-10-01T00:01:00Z 'A comment that mentions F3 wrong but is not a response.')"
+  printf '[%s]\n[%s]\n' \
+    "$(comment_json 7 2026-10-02T00:00:00Z "$(printf '\nreview-response\nF2: intentional - decided in #12')")" \
+    "$(comment_json 8 2026-10-03T00:00:00Z "$(printf 'review-response\nAstra F1 pre-existing\nSol F1 fixed')")"
+} > "$eval_dir/comments.json"
+node "$ROOT/evals/tally-responses.mjs" < "$eval_dir/comments.json" > "$eval_dir/tally.json"
+[ "$(jq -c '[.answers, .counts]' "$eval_dir/tally.json")" \
+  = '[4,{"fixed":1,"wrong":1,"intentional":1,"pre-existing":1}]' ] \
+  || fail "unexpected tally: $(jq -c . "$eval_dir/tally.json")"
+[ "$(jq -c '[.by_reviewer.Sol, .by_reviewer["(unnamed)"].intentional, .by_pull_request["8"].fixed, .shares.wrong]' "$eval_dir/tally.json")" \
+  = '[{"fixed":1,"wrong":1,"intentional":0,"pre-existing":0},1,1,0.25]' ] \
+  || fail "unexpected tally groups: $(jq -c . "$eval_dir/tally.json")"
+[ "$(jq -r '.responses[] | select(.finding == "F1" and .pull_request == 7) | .reason' "$eval_dir/tally.json")" \
+  = 'helper() is called at app.ts:177' ] || fail "the reason of an answer was not kept"
+node "$ROOT/evals/tally-responses.mjs" "$eval_dir/comments.json" > "$eval_dir/tally-file.json"
+cmp -s "$eval_dir/tally.json" "$eval_dir/tally-file.json" || fail "the tally must read files as it reads stdin"
+
+# The runner reviews a fixture with the action's scripts, posts nothing, and
+# scores it: here the stand-ins confirm the unchecked index and refute the
+# dead-code claim, so both expectations pass.
+PATH="$verified_bin:$PATH" STUB_REPLY="$TEMP_DIR/verified-reply.md" COPILOT_GITHUB_TOKEN=stub-token \
+EVAL_NO_DESCRIPTION=1 "$ROOT/evals/run-fixture.sh" "$eval_dir/fixture.json" "$verify_repo" \
+  "$eval_dir/run" > "$eval_dir/run.log" 2>&1 || fail "run-fixture.sh failed: $(cat "$eval_dir/run.log")"
+assert_contains "$eval_dir/run.log" "PASS local catch (real-catch): posted F1 (Important, line 15)"
+assert_contains "$eval_dir/run.log" "PASS local not-wired (false-positive): no posted finding matches"
+assert_contains "$eval_dir/run.log" "**1 finding to address** (1 Important, 0 Nit)."
+[ ! -e "$eval_dir/run/inline.json" ] || fail "the runner must not prepare an inline review"
 
 # A finder reply that does not follow the format is a failed call: its files
 # count as not reviewed, and the reply is kept below the fold.

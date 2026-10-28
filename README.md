@@ -586,3 +586,7 @@ Run the dependency-free test suite:
 ```sh
 bash tests/test.sh
 ```
+
+Score a prompt or model change against the eval fixtures before a release,
+and tally authors' answers to posted findings, with the tools in
+[`evals/`](evals/README.md).

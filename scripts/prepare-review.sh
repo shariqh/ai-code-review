@@ -16,8 +16,8 @@ case "$REVIEW_WORK_DIR" in
   /|""|.) echo "::error::unsafe REVIEW_WORK_DIR"; exit 1 ;;
 esac
 
-# The round cap: after MAX_ROUNDS rounds (0 for no cap) that left findings,
-# the reviewer stops instead of reviewing again. STICKY_ROUND and
+# The round cap: when the last review was round MAX_ROUNDS (0 for no cap) or
+# later and left findings, the reviewer stops instead of reviewing again. STICKY_ROUND and
 # STICKY_RESULT are the last review's round count and result, from
 # last-review.sh.
 MAX_ROUNDS=${MAX_ROUNDS:-3}
@@ -239,11 +239,13 @@ echo "diff bytes: $(wc -c < "$REVIEW_WORK_DIR/pr.diff")"
 # The pull request's whole diff, against the same trusted base, as GitHub
 # shows it: the verifier reads what the pull request changes in a file from
 # it, and an inline comment can sit only on a line of one of its hunks.
+full_diff=built
 if git -C "$REVIEW_REPO_DIR" diff "$context_rev...$HEAD_SHA" > "$REVIEW_WORK_DIR/pr-full.diff" \
   && node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" commentable \
     "$REVIEW_WORK_DIR/pr-full.diff" "$REVIEW_WORK_DIR/commentable.json"; then
   :
 else
+  full_diff=failed
   echo "the pull request's full diff could not be built, so no finding will be posted inline"
   : > "$REVIEW_WORK_DIR/pr-full.diff"
   rm -f "$REVIEW_WORK_DIR/commentable.json"
@@ -254,7 +256,7 @@ fi
 # changes a path that matches one of PATHS (shell patterns, separated by
 # commas or newlines, in which * also matches /). Otherwise the step output
 # skip is true and the later steps do nothing. With neither set, every pull
-# request is reviewed. When the paths cannot be listed, it reviews.
+# request is reviewed. When the conditions cannot be checked, it reviews.
 MIN_DIFF_BYTES=${MIN_DIFF_BYTES:-0}
 if ! [[ "$MIN_DIFF_BYTES" =~ ^[0-9]+$ ]]; then
   echo "::error::min-diff-bytes must be a non-negative integer"
@@ -269,7 +271,9 @@ done
 if [ "$MIN_DIFF_BYTES" -gt 0 ] || [ "${#patterns[@]}" -gt 0 ]; then
   gate_reason=""
   full_bytes=$(wc -c < "$REVIEW_WORK_DIR/pr-full.diff" | tr -d '[:space:]')
-  if [ "$MIN_DIFF_BYTES" -gt 0 ] && [ "$full_bytes" -ge "$MIN_DIFF_BYTES" ]; then
+  if [ "$full_diff" = failed ]; then
+    gate_reason="the pull request's diff could not be built to check them"
+  elif [ "$MIN_DIFF_BYTES" -gt 0 ] && [ "$full_bytes" -ge "$MIN_DIFF_BYTES" ]; then
     gate_reason="its diff is $full_bytes bytes, at least min-diff-bytes ($MIN_DIFF_BYTES)"
   fi
   if [ -z "$gate_reason" ] && [ "${#patterns[@]}" -gt 0 ]; then
@@ -289,7 +293,9 @@ if [ "$MIN_DIFF_BYTES" -gt 0 ] || [ "${#patterns[@]}" -gt 0 ]; then
     fi
   fi
   if [ -z "$gate_reason" ]; then
-    echo "::notice::This reviewer reviews only pull requests whose diff is at least ${MIN_DIFF_BYTES} bytes (0 means no size condition) or that change a path matching '${PATHS:-}'; this one does neither, so it is skipped."
+    paths_shown=${PATHS:-}
+    paths_shown=${paths_shown//$'\n'/, }
+    echo "::notice::This reviewer reviews only pull requests whose diff is at least ${MIN_DIFF_BYTES} bytes (0 means no size condition) or that change a path matching '${paths_shown}'; this one does neither, so it is skipped."
     echo "skip=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     exit 0
   fi

@@ -20,7 +20,7 @@ large diffs at file boundaries, disclose any truncation or failed model calls,
 and never report a failed or partial review as clean. By default, later
 rounds review only the commits since each reviewer's last review (see
 [Incremental reviews](#incremental-reviews)), no finding is reported twice,
-and a reviewer pauses after three rounds that each left findings (see
+and a reviewer pauses when findings remain after three rounds (see
 [Rounds and repeats](#rounds-and-repeats)).
 
 ## Copilot token
@@ -141,7 +141,7 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `review-file` | `REVIEW.md` | Repository review guide (base branch only; empty disables) |
 | `full-files-max-bytes` | `60000` | Bytes of the touched files' head versions sent with each batch; `0` leaves them out |
 | `review-scope` | `since-last-review` | Review each pull request in full once, then only the commits since each reviewer's last complete review; `full` reviews it whole every time |
-| `max-rounds` | `3` | Pause after this many rounds that left findings; `0` for no cap |
+| `max-rounds` | `3` | Pause when findings remain after this many rounds; `0` for no cap |
 
 The only secret is `COPILOT_REVIEW_PAT`. Without it, a reviewer job on an
 eligible pull request fails, since `verify-landed` asks for a job that fails
@@ -252,7 +252,7 @@ be present.
 | `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
 | `review-scope` | `since-last-review` | Review each pull request in full once, then only the commits since this reviewer's last complete review; `full` reviews it whole every time |
-| `max-rounds` | `3` | Pause after this many rounds that left findings; `0` for no cap |
+| `max-rounds` | `3` | Pause when findings remain after this many rounds; `0` for no cap |
 | `min-diff-bytes` | `0` | Review only pull requests whose whole diff is at least this many bytes, or that match `paths`; `0` sets no size condition |
 | `paths` | empty | Review only pull requests that change a path matching one of these shell patterns (comma- or newline-separated; `*` also matches `/`), or that reach `min-diff-bytes` |
 
@@ -351,6 +351,8 @@ happened; a partial failure is a warning.
 
 A reply that does not follow the findings format is treated the same way:
 its files count as not reviewed, and the reply itself is shown below the fold.
+A reply with a finding that cannot be read (no title or text) is listed in
+the same note, and the review counts as incomplete.
 A verification call that fails, or whose reply has no verdict, leaves its
 finding unverified and adds a second **Incomplete review** note; if every
 verification call failed, the job fails too.
@@ -449,7 +451,9 @@ An incremental review re-checks only the commits since the last review, so
 findings from before stand until a full review. The comment lists them under
 **Earlier findings still open**, they count in its summary line, and the
 `ai-code-review-result` marker stays `findings` even when the new commits
-raise nothing. On an incremental review `clean` therefore means that the
+raise nothing, unless the verifier, checking a finding whose file the new
+commits change, finds it no longer applies (see
+[Rounds and repeats](#rounds-and-repeats)). On an incremental review `clean` therefore means that the
 review it builds on was clean and the commits since raised nothing.
 
 To review a pull request in full again, run with `review-scope: full`. That
@@ -473,16 +477,22 @@ count. The next run reads both from the reviewer's own sticky.
   that does anyway, with the same file and title, is left out, and the
   comment says how many were; one that was not verified is verified again
   under its old id.
-- **Closing.** An incremental review leaves earlier findings open. A full
-  review that covered every file asks the finder which open findings still
-  apply (`still_present`), keeps those open, and closes the rest as fixed.
-  A full review that left something out closes nothing.
+- **Closing.** An earlier finding closes only when the verifier, checking it
+  again at the new head, refutes it; the comment then says it is no longer
+  open. A full review checks every open finding the finder does not report
+  again or name as still applying (`still_present`); an incremental review
+  checks those whose file its commits change. A finding never verified is
+  always checked, and stays open, with the review incomplete, until it is.
+  These checks share `max-verifications` with the round's own findings,
+  after them; one past the cap stays open. With verification off, a full
+  review that covered every file closes the open findings it did not report
+  again or name as still applying.
 - **Round cap.** When the last review was round `max-rounds` (3) or later
   and its result was `findings`, the next run calls no model. Its comment
   keeps the earlier findings, says the new commits were not reviewed, and
-  asks for the approach to be reconsidered: three rounds that each left
-  findings usually mean the change needs splitting or a design decision from
-  a person, not another round with the reviewer. Its coverage is recorded as
+  asks for the approach to be reconsidered: a pull request that still has
+  findings to address after three rounds usually needs splitting or a design
+  decision from a person, not another round with the reviewer. Its coverage is recorded as
   incomplete and its result stays `findings`. A round that ended `clean`
   never pauses the next. To start over, delete the reviewer's sticky comment
   and push or re-run: the next run is round 1 and a full review. With

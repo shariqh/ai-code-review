@@ -135,7 +135,7 @@ inputs:
     default: ""
   max-rounds:
     description: >-
-      After this many review rounds that left findings, pause instead of
+      When findings remain after this many review rounds, pause instead of
       reviewing again, and ask for the approach to be reconsidered; 0 for no
       cap
     required: false

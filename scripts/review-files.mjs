@@ -16,7 +16,8 @@
 //       each file the batch's diff touches, numbered by line, whole or the
 //       window around its first change, for the finder
 //   verify-context <work dir> <repo dir> <head sha>
-//       for each finding findings.json marks for verification, the directory
+//       for each finding findings.json marks for verification, and each
+//       earlier finding it marks for a recheck, the directory
 //       verify/<id>/ with finding.txt, file.txt (the head version of the file
 //       it names, numbered by line), changes.diff (what the pull request
 //       changes in that file, from pr-full.diff) and references.txt (where
@@ -94,7 +95,7 @@ export function splitDiff(text) {
 }
 
 export function commentableLines(diffText) {
-  const ranges = {};
+  const ranges = Object.create(null);
   for (const fragment of splitDiff(diffText)) {
     if (!fragment.newPath) continue;
     for (const line of fragment.text.split("\n")) {
@@ -132,7 +133,12 @@ export function headFile(repoDir, head, path) {
   const [, mode, type, oid, size] = match;
   if (type !== "blob") return { kind: "none", note: `the path is a ${type === "commit" ? "submodule" : "directory"} at the head commit` };
   if (Number(size) > BLOB_READ_MAX_BYTES) return { kind: "none", note: `the file is ${size} bytes, too large to read` };
-  const content = git(repoDir, ["cat-file", "blob", oid], { encoding: "buffer" });
+  let content;
+  try {
+    content = git(repoDir, ["cat-file", "blob", oid], { encoding: "buffer" });
+  } catch {
+    return { kind: "none", note: "the file could not be read from the head commit" };
+  }
   if (mode === "120000") {
     return { kind: "none", note: `the path is a symbolic link to ${content.toString("utf8").slice(0, 200)}` };
   }
@@ -276,6 +282,9 @@ function findingText(finding) {
     ? `${finding.path}${finding.line ? `:${finding.line}${finding.end_line ? `-${finding.end_line}` : ""}` : ""}`
     : "(no location given)";
   const lines = [`id: ${finding.id}`, `severity: ${finding.severity}`, `location: ${where}`, `title: ${finding.title}`];
+  if (finding.round) {
+    lines.push(`status: reported in round ${finding.round} of this review; decide whether it still applies at the head commit`);
+  }
   if (finding.issue) lines.push("issue:", finding.issue);
   if (finding.impact) lines.push("impact:", finding.impact);
   if (finding.fix) lines.push("fix:", finding.fix);
@@ -286,8 +295,9 @@ export function verifyContext(workDir, repoDir, head) {
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error("the head must be a full commit SHA");
   const findingsPath = join(workDir, "findings.json");
   if (!existsSync(findingsPath)) return 0;
-  const { findings } = JSON.parse(readFileSync(findingsPath, "utf8"));
-  const pending = findings.filter((finding) => finding.verify === "pending");
+  const { findings, rechecks = [] } = JSON.parse(readFileSync(findingsPath, "utf8"));
+  const pending = [...findings, ...rechecks].filter((finding) => finding.verify === "pending");
+  rmSync(join(workDir, "verify"), { recursive: true, force: true });
   const fullDiffPath = join(workDir, "pr-full.diff");
   const fragments = existsSync(fullDiffPath) ? splitDiff(readFileSync(fullDiffPath, "utf8")) : [];
   for (const finding of pending) {

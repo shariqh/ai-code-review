@@ -137,8 +137,8 @@ on:
         default: since-last-review
       max-rounds:
         description: >-
-          After this many review rounds that left findings, a reviewer pauses
-          instead of reviewing again; 0 for no cap
+          When findings remain after this many review rounds, a reviewer
+          pauses instead of reviewing again; 0 for no cap
         type: number
         default: 3
     secrets:

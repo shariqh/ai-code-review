@@ -25,9 +25,10 @@
 //                               ledger.b64, review.json and, when a confirmed
 //                               finding sits on a line the pull request
 //                               changes, inline.json
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { splitDiff } from "./review-files.mjs";
 
 export const UNSTRUCTURED = 3;
 export const SEVERITIES = ["Important", "Nit", "Pre-existing"];
@@ -56,7 +57,7 @@ export function cleanText(value, max) {
     .replace(/\r\n?/g, "\n")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
-  if (text.length > max) text = `${text.slice(0, max).trimEnd()} [...]`;
+  if (text.length > max) text = `${text.slice(0, max - 6).trimEnd()} [...]`;
   return text;
 }
 
@@ -82,8 +83,10 @@ function lineRange(line, endLine) {
   return { start, end };
 }
 
-// One finding from a reply, or null when it names nothing.
-export function normalizeFinding(raw) {
+// One finding from a reply (an object, or a bare string taken as its
+// issue), or null when it names nothing.
+export function normalizeFinding(entry) {
+  const raw = typeof entry === "string" ? { issue: entry } : entry;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   let path = oneLine(raw.path ?? raw.file ?? "", 300).replace(/^\.\//, "");
   let { start, end } = lineRange(raw.line ?? raw.start_line, raw.end_line);
@@ -92,7 +95,8 @@ export function normalizeFinding(raw) {
     path = located[1];
     ({ start, end } = lineRange(located[3] ? `${located[2]}-${located[3]}` : located[2]));
   }
-  const issue = cleanText(raw.issue ?? raw.description ?? "", 2000);
+  const issue = cleanText(
+    raw.issue ?? raw.description ?? raw.message ?? raw.body ?? raw.details ?? raw.problem ?? "", 2000);
   let title = oneLine(raw.title ?? raw.summary ?? "", 200);
   if (!title && issue) title = oneLine(issue.split(/(?<=[.!?])\s/)[0], 200);
   if (!title) return null;
@@ -237,7 +241,8 @@ export function decodeLedger(encoded) {
     const { id, s, v, r, o, p, l, t } = entry;
     if (typeof id !== "string" || !/^F[0-9]{1,6}$/.test(id) || ids.has(id)
       || Number(id.slice(1)) >= value.next
-      || !(s in SEVERITY_NAMES) || !(v in VERDICT_NAMES)
+      || typeof s !== "string" || !Object.hasOwn(SEVERITY_NAMES, s)
+      || typeof v !== "string" || !Object.hasOwn(VERDICT_NAMES, v)
       || !Number.isSafeInteger(r) || r < 1 || r > 9999 || (o !== 0 && o !== 1)
       || typeof p !== "string" || p.length > 300
       || !(l === null || (Number.isSafeInteger(l) && l > 0))
@@ -315,6 +320,16 @@ export function readLedger(workDir, env) {
 // cap are not verified, which verify.overflow discloses as partial coverage.
 // For a full review, the earlier findings the finder says still apply
 // (still_present) or reports again stay open.
+//
+// Every other open earlier finding is rechecked: with verification on, the
+// verifier is asked whether it still applies at this head, which is the only
+// way it closes. A full review rechecks them all; an incremental one those
+// whose file its diff changes, and any that were never verified. Rechecks
+// come after this round's findings within the verification cap; one past the
+// cap stays open as it was.
+//
+// A reply with findings that cannot be read (no title or text) adds a line to
+// review.failures, so the review counts as incomplete rather than clean.
 export function collect(workDir, env) {
   const maxNits = nonNegative(env.MAX_NITS, 3);
   const maxVerifications = nonNegative(env.MAX_VERIFICATIONS, 10);
@@ -339,6 +354,12 @@ export function collect(workDir, env) {
   for (const name of names) {
     const parsed = JSON.parse(readFileSync(join(batchesDir, name), "utf8"));
     malformed += parsed.malformed ?? 0;
+    if ((parsed.malformed ?? 0) > 0) {
+      appendFileSync(
+        join(workDir, "review.failures"),
+        `- \`batches/${name.replace(/\.json$/, ".diff")}\` - ${parsed.malformed} ${plural(parsed.malformed, "finding", "findings")} in the reply could not be read; its files were NOT fully reviewed\n`,
+      );
+    }
     for (const id of parsed.still_present ?? []) {
       if (open.has(id)) stillPresent.add(id);
     }
@@ -394,8 +415,45 @@ export function collect(workDir, env) {
   kept.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]
     || Number(a.id.slice(1)) - Number(b.id.slice(1)));
 
+  const keptIds = new Set(kept.map((finding) => finding.id));
+  let changed = null;
+  if (incremental && existsSync(join(workDir, "pr.diff"))) {
+    changed = new Set();
+    for (const fragment of splitDiff(readFileSync(join(workDir, "pr.diff"), "utf8"))) {
+      if (fragment.newPath) changed.add(fragment.newPath);
+      if (fragment.oldPath) changed.add(fragment.oldPath);
+    }
+  }
+  const rechecks = [];
+  const paused = existsSync(join(workDir, "scope.paused"));
+  if (verify && !paused) {
+    for (const entry of ledger.f) {
+      if (entry.o !== 1 || keptIds.has(entry.id) || !["c", "s", "u"].includes(entry.v)) continue;
+      // The finder's word keeps a verified finding open, but an unverified
+      // one is checked.
+      if (stillPresent.has(entry.id) && entry.v !== "u") continue;
+      if (incremental && entry.v !== "u" && !(changed && changed.has(entry.p))) continue;
+      const recheck = {
+        id: entry.id,
+        severity: SEVERITY_NAMES[entry.s],
+        path: entry.p,
+        line: entry.l,
+        end_line: null,
+        title: entry.t,
+        issue: "",
+        impact: "",
+        fix: "",
+        round: entry.r,
+        verify: verifications < maxVerifications ? "pending" : "skipped",
+      };
+      if (recheck.verify === "pending") verifications += 1;
+      rechecks.push(recheck);
+    }
+  }
+
   const result = {
     findings: kept,
+    rechecks,
     still_present: incremental ? [] : [...stillPresent],
     next,
     dropped: { duplicates, malformed, nits_over_cap: nitsOverCap, repeats },
@@ -435,7 +493,7 @@ function safe(text) {
 
 function location(finding) {
   if (!finding.path) return "";
-  const path = finding.path.replace(/`/g, "'");
+  const path = safe(finding.path).replace(/`/g, "'");
   if (!finding.line) return `\`${path}\``;
   return `\`${path}:${finding.line}${finding.end_line ? `-${finding.end_line}` : ""}\``;
 }
@@ -484,11 +542,14 @@ function onDiff(ranges, line) {
 const COUNTED = new Set(["Important", "Nit"]);
 const VISIBLE = new Set(["confirmed", "skipped"]);
 
-function earlierLine(entry) {
+function earlierLine(entry, rechecked) {
   const where = entry.p
-    ? ` · \`${entry.p.replace(/`/g, "'")}${entry.l ? `:${entry.l}` : ""}\``
+    ? ` · \`${safe(entry.p).replace(/`/g, "'")}${entry.l ? `:${entry.l}` : ""}\``
     : "";
-  return `- **${entry.id}** · ${SEVERITY_NAMES[entry.s]}${where} — ${safe(entry.t)} (round ${entry.r})`;
+  const status = rechecked.has(entry.id)
+    ? ", checked again: still applies"
+    : entry.v === "u" ? ", not verified" : "";
+  return `- **${entry.id}** · ${SEVERITY_NAMES[entry.s]}${where} — ${safe(entry.t)} (round ${entry.r}${status})`;
 }
 
 // findings.json, the verifier's verdicts (verify/<id>/verdict.json) and the
@@ -554,13 +615,33 @@ export function render(workDir, env) {
   const finderComplete = read("overflow.note").trim() === "" && read("review.failures").trim() === ""
     && unstructured.length === 0;
 
-  // The ledger after this round. A full review that covered every file
-  // closes each earlier finding it did not report again or name as still
-  // present: it was fixed, or was never real. An incremental, paused or
-  // partial review leaves them as they were.
+  // The ledger after this round. With verification on, an earlier finding
+  // closes only when the verifier, rechecking it at this head, refutes it; a
+  // confirmation makes it confirmed, and a recheck that did not happen
+  // leaves it as it was. With verification off, a full review that covered
+  // every file closes each earlier finding it did not report again or name
+  // as still present, and so does a full review with nothing to review. An
+  // incremental, paused or partial review leaves them as they were.
   const stillPresent = new Set(data.still_present ?? []);
   const entries = ledger.f.map((entry) => ({ ...entry }));
-  if (since === "" && !paused && completed > 0 && finderComplete) {
+  const fixed = [];
+  const rechecked = new Set();
+  for (const recheck of data.rechecks ?? []) {
+    if (recheck.verify !== "pending") continue;
+    const verdict = readJson(join(workDir, "verify", recheck.id, "verdict.json"));
+    const entry = entries.find((existing) => existing.id === recheck.id);
+    if (!entry || !verdict) continue;
+    if (verdict.verdict === "refuted") {
+      if (entry.v === "u") entry.v = "r";
+      entry.o = 0;
+      fixed.push({ id: entry.id, reason: oneLine(verdict.reason ?? "", 300) });
+    } else if (verdict.verdict === "confirmed") {
+      entry.v = "c";
+      rechecked.add(entry.id);
+    }
+  }
+  if (verifierModel === "" && since === "" && !paused && finderComplete
+    && (completed > 0 || attempted === 0)) {
     for (const entry of entries) {
       if (entry.o === 1 && !findings.some((f) => f.id === entry.id)) entry.o = stillPresent.has(entry.id) ? 1 : 0;
     }
@@ -586,7 +667,9 @@ export function render(workDir, env) {
   const updated = trimLedger({ v: 1, next, f: entries });
   const thisRound = new Set(findings.map((f) => f.id));
   const earlierOpen = updated.f.filter((entry) => entry.o === 1 && !thisRound.has(entry.id)
-    && (entry.v === "c" || entry.v === "s"));
+    && entry.v !== "r");
+  // An open finding that was never verified leaves the review incomplete.
+  const unverifiedOpen = updated.f.some((entry) => entry.o === 1 && entry.v === "u");
 
   const countedEntries = updated.f.filter((entry) => entry.o === 1 && (entry.s === "I" || entry.s === "N")
     && (entry.v === "c" || entry.v === "s"));
@@ -600,6 +683,7 @@ export function render(workDir, env) {
     .some((name) => read(name).trim() !== "")
     || findings.some((f) => f.verdict === "unverified")
     || unstructured.length > 0
+    || unverifiedOpen
     || paused;
   // A sticky from before the ledger records no findings, so the result of
   // the review an incremental one builds on stands.
@@ -633,7 +717,7 @@ export function render(workDir, env) {
   if (paused) {
     const commits = since !== "" ? `the commits since \`${since}\`` : "the commits since the last review";
     body.push(`> **Review paused** after ${previousRound} rounds - ${commits} were NOT reviewed. `
-      + "Three rounds that each left findings to address usually mean the approach needs another look: "
+      + "A pull request that still has findings to address after three rounds usually needs another look at the approach: "
       + "reconsider it (split the change, or settle the design with a person) rather than iterating with the reviewer. "
       + "To start over with a full review, delete this comment and push or re-run.");
   } else if (emptyIncremental) {
@@ -642,16 +726,20 @@ export function render(workDir, env) {
       : `_Nothing new to review: the files this pull request changes are the same as at \`${since}\`, so the findings of the review of that commit still apply. ${listed}_`);
   } else if (since !== "" && completed > 0 && counted.length === 0
     && (earlierOpen.length > 0 || carried)) {
-    body.push(`_No new issues in the commits since \`${since}\`, but the findings of the review of that commit were not re-checked and still stand. ${listed}_`);
+    body.push(`_No new issues in the commits since \`${since}\`, but the findings of earlier reviews still stand. ${listed}_`);
   }
   if (main.length > 0) {
     body.push("### Findings", ...main.map((f) => findingBlock(f, verifierModel)));
   }
   if (earlierOpen.length > 0) {
-    const note = since === "" && !paused && completed > 0
-      ? "_Reported in an earlier round and still present in this review._"
-      : "_Reported in an earlier round and not re-checked by this review._";
-    body.push("### Earlier findings still open", note, earlierOpen.map(earlierLine).join("\n"));
+    body.push(
+      "### Earlier findings still open",
+      "_Reported in an earlier round. Unless marked as checked again, this review did not re-check them._",
+      earlierOpen.map((entry) => earlierLine(entry, rechecked)).join("\n"),
+    );
+  }
+  if (fixed.length > 0) {
+    body.push(`_No longer open: ${fixed.map((f) => `**${f.id}** (${safe(f.reason)})`).join("; ")}. The verifier found ${plural(fixed.length, "it no longer applies", "they no longer apply")} at this head._`);
   }
   if (preExisting.length > 0) {
     body.push(
@@ -668,7 +756,7 @@ export function render(workDir, env) {
     );
   }
   for (const name of unstructured) {
-    const raw = cleanText(readFileSync(join(unstructuredDir, name), "utf8"), 8000);
+    const raw = safe(cleanText(readFileSync(join(unstructuredDir, name), "utf8"), 8000));
     const ticks = fence(raw);
     body.push(
       `<details><summary>The reply for ${name.replace(/\.md$/, "")}, which did not follow the findings format</summary>`,
@@ -696,7 +784,8 @@ export function render(workDir, env) {
 
   const commentable = readJson(join(workDir, "commentable.json")) ?? {};
   const inline = findings
-    .filter((f) => f.verdict === "confirmed" && f.path && f.line && onDiff(commentable[f.path], f.line))
+    .filter((f) => f.verdict === "confirmed" && f.path && f.line && Object.hasOwn(commentable, f.path)
+      && onDiff(commentable[f.path], f.line))
     .slice(0, 20);
 
   writeFileSync(join(workDir, "summary.md"), `${summary}\n`);

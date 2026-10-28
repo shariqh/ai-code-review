@@ -127,12 +127,18 @@ on:
         default: 60000
       review-scope:
         description: >-
-          full reviews the whole pull request on every run. since-last-review
-          reviews it in full once, then each reviewer reviews only the commits
-          since the head it last reviewed completely, falling back to a full
-          review when that head cannot be trusted.
+          since-last-review reviews the pull request in full once, then each
+          reviewer reviews only the commits since the head it last reviewed
+          completely, falling back to a full review when that head cannot be
+          trusted. full reviews the whole pull request on every run.
         type: string
-        default: full
+        default: since-last-review
+      max-rounds:
+        description: >-
+          After this many review rounds that left findings, a reviewer pauses
+          instead of reviewing again; 0 for no cap
+        type: number
+        default: 3
     secrets:
       COPILOT_REVIEW_PAT:
         description: >-
@@ -212,5 +218,6 @@ jobs:
           review-file: ${{ inputs.review-file }}
           full-files-max-bytes: ${{ inputs.full-files-max-bytes }}
           review-scope: ${{ inputs.review-scope }}
+          max-rounds: ${{ inputs.max-rounds }}
           verify-landed: ${{ inputs.verify-landed }}
           allow-missing-token: ${{ inputs.allow-missing-token }}

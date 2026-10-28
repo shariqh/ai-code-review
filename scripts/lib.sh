@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 
 # A review is complete when nothing was truncated or left out by the batch
-# or verification cap, and no review or verification call failed, whatever it
-# found. Only a complete review can be the starting point of a
-# since-last-review run.
+# or verification cap, no review or verification call failed, and the round
+# cap did not pause it, whatever it found. Only a complete review can be the
+# starting point of a since-last-review run.
 is_complete_review() {
   local work_dir=${1:?work directory is required}
   [ ! -s "$work_dir/overflow.note" ] && [ ! -s "$work_dir/review.failures" ] \
-    && [ ! -s "$work_dir/verify.failures" ]
+    && [ ! -s "$work_dir/verify.failures" ] && [ ! -s "$work_dir/verify.overflow" ] \
+    && [ ! -s "$work_dir/scope.paused" ]
 }
 
 # An incremental review with an empty diff: none of the pull request's files
@@ -135,6 +136,33 @@ sticky_scope_fields() {
       if (coverage == "") coverage = "-"
       if (base == "") base = "- -"
       printf "%s %s %s %s\n", result, full, coverage, base
+    }
+  '
+}
+
+# Print the round count and the ledger of earlier findings recorded in a
+# sticky comment's header as "<round> <ledger>", with "-" for anything
+# missing. post-comment.sh writes both for every review; findings.mjs checks
+# the ledger's content. Like sticky_header_fields, it reads the header only.
+sticky_review_fields() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<!-- ai-code-review-result: / { complete = 1; exit }
+    round == "" && /^<!-- ai-code-review-round: [0-9]+ -->$/ {
+      round = $0
+      sub(/^<!-- ai-code-review-round: /, "", round)
+      sub(/ -->$/, "", round)
+    }
+    ledger == "" && /^<!-- ai-code-review-ledger: [A-Za-z0-9+\/]+=*=* -->$/ {
+      ledger = $0
+      sub(/^<!-- ai-code-review-ledger: /, "", ledger)
+      sub(/ -->$/, "", ledger)
+    }
+    END {
+      if (!complete) { round = ""; ledger = "" }
+      if (round == "") round = "-"
+      if (ledger == "") ledger = "-"
+      printf "%s %s\n", round, ledger
     }
   '
 }

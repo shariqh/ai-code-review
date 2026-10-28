@@ -113,12 +113,19 @@ inputs:
     default: "false"
   review-scope:
     description: >-
-      full reviews the whole pull request on every run. since-last-review
-      reviews it in full once, then only the commits since the head this
-      reviewer last reviewed completely, falling back to a full review when
-      that head cannot be trusted (see the README).
+      since-last-review reviews the pull request in full once, then only the
+      commits since the head this reviewer last reviewed completely, falling
+      back to a full review when that head cannot be trusted (see the
+      README). full reviews the whole pull request on every run.
     required: false
-    default: full
+    default: since-last-review
+  max-rounds:
+    description: >-
+      After this many review rounds that left findings, pause instead of
+      reviewing again, and ask for the approach to be reconsidered; 0 for no
+      cap
+    required: false
+    default: "3"
 
 runs:
   using: composite
@@ -142,6 +149,7 @@ runs:
         VERIFY_LANDED: ${{ inputs.verify-landed }}
         ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
         REVIEW_SCOPE: ${{ inputs.review-scope }}
+        MAX_ROUNDS: ${{ inputs.max-rounds }}
         REVIEW_MODEL: ${{ inputs.model }}
         VERIFIER_MODEL: ${{ inputs.verifier-model }}
         VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
@@ -186,17 +194,19 @@ runs:
         ref: ${{ github.event.pull_request.head.sha }}
         path: .ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
 
-    # Only for review-scope since-last-review: read the head this reviewer
-    # last reviewed from its own sticky comment.
+    # Read the round count, the earlier findings and the last result from
+    # this reviewer's own sticky comment, and for review-scope
+    # since-last-review the head it last reviewed.
     - name: Find this reviewer's last review
       id: last-review
-      if: steps.guard.outputs.skip == 'false' && inputs.review-scope == 'since-last-review'
+      if: steps.guard.outputs.skip == 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
+        REVIEW_SCOPE: ${{ inputs.review-scope }}
       run: "$GITHUB_ACTION_PATH/scripts/last-review.sh"
 
     - name: Build review batches
@@ -219,6 +229,10 @@ runs:
         LAST_REVIEW_RESULT: ${{ steps.last-review.outputs.result }}
         LAST_BASE_REF: ${{ steps.last-review.outputs.base-ref }}
         LAST_MERGE_BASE: ${{ steps.last-review.outputs.merge-base }}
+        STICKY_ROUND: ${{ steps.last-review.outputs.round }}
+        STICKY_LEDGER: ${{ steps.last-review.outputs.ledger }}
+        STICKY_RESULT: ${{ steps.last-review.outputs.last-result }}
+        MAX_ROUNDS: ${{ inputs.max-rounds }}
       run: "$GITHUB_ACTION_PATH/scripts/prepare-review.sh"
 
     - name: Read the pull request's description

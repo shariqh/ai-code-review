@@ -17,11 +17,15 @@
 //   collect <work dir>          every batch's findings into findings.json
 //   verdict <reply> <out.json>  one verifier reply; exits 3 when the reply
 //                               does not follow the verdict format
-//   render <work dir>           findings and verdicts into summary.md,
-//                               body.md, result, review.json and, when a
-//                               confirmed finding sits on a line the pull
-//                               request changes, inline.json
-import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+//   ledger-read <work dir>      STICKY_LEDGER, the earlier findings from
+//                               the sticky comment, into ledger.json and
+//                               earlier-findings.txt
+//   render <work dir>           findings, verdicts and the ledger into
+//                               summary.md, body.md, result, round,
+//                               ledger.b64, review.json and, when a confirmed
+//                               finding sits on a line the pull request
+//                               changes, inline.json
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -191,26 +195,153 @@ function plural(count, one, many) {
 
 const SEVERITY_ORDER = { Important: 0, Nit: 1, "Pre-existing": 2 };
 
+// The ledger: the findings earlier rounds reported on this pull request,
+// carried in the sticky comment's header as base64 JSON, so that a later
+// round never reports one again and the comment can list those still open.
+// Each entry is {id, s: severity (I, N or P), v: verdict (c confirmed,
+// r refuted, u unverified, s not verified because verification was off),
+// r: the round that reported it, o: 1 while it is open, p: path, l: line,
+// t: title}; `next` is the next id's number, so ids are never reused.
+const SEVERITY_CODES = { Important: "I", Nit: "N", "Pre-existing": "P" };
+const SEVERITY_NAMES = { I: "Important", N: "Nit", P: "Pre-existing" };
+const VERDICT_CODES = { confirmed: "c", refuted: "r", unverified: "u", skipped: "s" };
+const VERDICT_NAMES = { c: "confirmed", r: "refuted", u: "unverified", s: "not verified" };
+export const LEDGER_MAX_ENTRIES = 40;
+export const LEDGER_MAX_CHARS = 24000;
+
+export function emptyLedger() {
+  return { v: 1, next: 1, f: [] };
+}
+
+// A ledger from the sticky comment, which anyone with write access can edit,
+// so every field is checked; anything malformed means no ledger.
+export function decodeLedger(encoded) {
+  if (typeof encoded !== "string" || encoded === "" || encoded.length > LEDGER_MAX_CHARS
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    return null;
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!value || value.v !== 1 || !Number.isSafeInteger(value.next) || value.next < 1
+    || !Array.isArray(value.f) || value.f.length > LEDGER_MAX_ENTRIES) {
+    return null;
+  }
+  const ids = new Set();
+  const entries = [];
+  for (const entry of value.f) {
+    if (!entry || typeof entry !== "object") return null;
+    const { id, s, v, r, o, p, l, t } = entry;
+    if (typeof id !== "string" || !/^F[0-9]{1,6}$/.test(id) || ids.has(id)
+      || Number(id.slice(1)) >= value.next
+      || !(s in SEVERITY_NAMES) || !(v in VERDICT_NAMES)
+      || !Number.isSafeInteger(r) || r < 1 || r > 9999 || (o !== 0 && o !== 1)
+      || typeof p !== "string" || p.length > 300
+      || !(l === null || (Number.isSafeInteger(l) && l > 0))
+      || typeof t !== "string" || t === "" || t.length > 200) {
+      return null;
+    }
+    ids.add(id);
+    entries.push({ id, s, v, r, o, p: oneLine(p, 300), l, t: oneLine(t, 200) });
+  }
+  return { v: 1, next: value.next, f: entries };
+}
+
+export function encodeLedger(ledger) {
+  return Buffer.from(JSON.stringify(ledger)).toString("base64");
+}
+
+// At most LEDGER_MAX_ENTRIES entries and LEDGER_MAX_CHARS once encoded: the
+// oldest closed entries go first, then the oldest refuted ones, then the
+// oldest open ones.
+function trimLedger(ledger) {
+  const entries = [...ledger.f];
+  const drop = () => {
+    let index = entries.findIndex((entry) => entry.o === 0 && entry.v !== "r");
+    if (index < 0) index = entries.findIndex((entry) => entry.v === "r");
+    entries.splice(index < 0 ? 0 : index, 1);
+  };
+  while (entries.length > LEDGER_MAX_ENTRIES) drop();
+  while (entries.length > 0 && encodeLedger({ ...ledger, f: entries }).length > LEDGER_MAX_CHARS) drop();
+  return { ...ledger, f: entries };
+}
+
+function entryAsFinding(entry) {
+  return { path: entry.p, title: entry.t };
+}
+
+function entryLine(entry) {
+  const where = entry.p ? ` ${entry.p}${entry.l ? `:${entry.l}` : ""}` : "";
+  return `${entry.id} [${SEVERITY_NAMES[entry.s]}, ${VERDICT_NAMES[entry.v]}${entry.o ? ", open" : ""}]${where} - ${entry.t}`;
+}
+
+// The entries a later round must not report again: the open ones and the
+// refuted ones. A confirmed finding that a full review closed was fixed, so
+// it can be reported again if it comes back.
+function remembered(entry) {
+  return entry.o === 1 || entry.v === "r";
+}
+
+// STICKY_LEDGER (from last-review.sh) into ledger.json, and the earlier
+// findings the finder must not report again into earlier-findings.txt.
+export function readLedger(workDir, env) {
+  const encoded = env.STICKY_LEDGER ?? "";
+  let ledger = emptyLedger();
+  let note = "none";
+  if (encoded !== "") {
+    const decoded = decodeLedger(encoded);
+    if (decoded) {
+      ledger = decoded;
+      note = `${decoded.f.length} earlier ${plural(decoded.f.length, "finding", "findings")}`;
+    } else {
+      note = "malformed, so this review starts a new one";
+    }
+  }
+  writeFileSync(join(workDir, "ledger.json"), `${JSON.stringify(ledger)}\n`);
+  const lines = ledger.f.filter(remembered).map(entryLine);
+  writeFileSync(join(workDir, "earlier-findings.txt"), lines.length > 0 ? `${lines.join("\n")}\n` : "");
+  return note;
+}
+
 // Every batch's parsed reply (batches/batch_NNN.json) into findings.json:
-// duplicates merged, Important first, nits past MAX_NITS left out, ids
-// assigned, and the first MAX_VERIFICATIONS findings marked for the verifier
-// unless VERIFIER_MODEL is empty. Findings past that cap are not verified,
-// which the comment discloses as partial coverage.
+// duplicates merged, repeats of an earlier finding (ledger.json) left out,
+// Important first, nits past MAX_NITS left out, ids assigned after the
+// ledger's, and the first MAX_VERIFICATIONS findings marked for the verifier
+// unless VERIFIER_MODEL is empty. A repeat of a finding that could not be
+// verified keeps its id and is verified again. Findings past the verification
+// cap are not verified, which verify.overflow discloses as partial coverage.
+// For a full review, the earlier findings the finder says still apply
+// (still_present) or reports again stay open.
 export function collect(workDir, env) {
   const maxNits = nonNegative(env.MAX_NITS, 3);
   const maxVerifications = nonNegative(env.MAX_VERIFICATIONS, 10);
   const verify = (env.VERIFIER_MODEL ?? "") !== "";
+  const incremental = existsSync(join(workDir, "scope.since"))
+    && readFileSync(join(workDir, "scope.since"), "utf8").trim() !== "";
+  const ledger = readJson(join(workDir, "ledger.json")) ?? emptyLedger();
+  const earlier = new Map();
+  for (const entry of ledger.f.filter(remembered)) earlier.set(fingerprint(entryAsFinding(entry)), entry);
+  const open = new Set(ledger.f.filter((entry) => entry.o === 1).map((entry) => entry.id));
+
   const batchesDir = join(workDir, "batches");
   const names = existsSync(batchesDir)
     ? readdirSync(batchesDir).filter((name) => /^batch_[0-9]+\.json$/.test(name)).sort()
     : [];
   const seen = new Set();
   const found = [];
+  const stillPresent = new Set();
   let duplicates = 0;
   let malformed = 0;
+  let repeats = 0;
   for (const name of names) {
     const parsed = JSON.parse(readFileSync(join(batchesDir, name), "utf8"));
     malformed += parsed.malformed ?? 0;
+    for (const id of parsed.still_present ?? []) {
+      if (open.has(id)) stillPresent.add(id);
+    }
     for (const finding of parsed.findings) {
       const key = fingerprint(finding);
       if (seen.has(key)) {
@@ -218,6 +349,14 @@ export function collect(workDir, env) {
         continue;
       }
       seen.add(key);
+      const entry = earlier.get(key);
+      if (entry && entry.v === "u" && entry.o === 1) {
+        finding.id = entry.id;
+      } else if (entry) {
+        repeats += 1;
+        if (entry.o === 1) stillPresent.add(entry.id);
+        continue;
+      }
       found.push(finding);
     }
   }
@@ -234,12 +373,14 @@ export function collect(workDir, env) {
     kept.push(finding);
   }
 
-  let next = 1;
+  let next = ledger.next;
   let verifications = 0;
   let overCap = 0;
   for (const finding of kept) {
-    finding.id = `F${next}`;
-    next += 1;
+    if (!finding.id) {
+      finding.id = `F${next}`;
+      next += 1;
+    }
     if (!verify) {
       finding.verify = "off";
     } else if (verifications < maxVerifications) {
@@ -250,17 +391,22 @@ export function collect(workDir, env) {
       overCap += 1;
     }
   }
+  kept.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]
+    || Number(a.id.slice(1)) - Number(b.id.slice(1)));
 
   const result = {
     findings: kept,
-    dropped: { duplicates, malformed, nits_over_cap: nitsOverCap },
+    still_present: incremental ? [] : [...stillPresent],
+    next,
+    dropped: { duplicates, malformed, nits_over_cap: nitsOverCap, repeats },
     max_nits: maxNits,
     max_verifications: maxVerifications,
   };
   writeFileSync(join(workDir, "findings.json"), `${JSON.stringify(result, null, 2)}\n`);
+  rmSync(join(workDir, "verify.overflow"), { force: true });
   if (overCap > 0) {
-    appendFileSync(
-      join(workDir, "overflow.note"),
+    writeFileSync(
+      join(workDir, "verify.overflow"),
       `- verification cap (${maxVerifications}) reached: ${overCap} ${plural(overCap, "finding was", "findings were")} NOT verified and ${plural(overCap, "is", "are")} listed below the fold\n`,
     );
   }
@@ -338,30 +484,47 @@ function onDiff(ranges, line) {
 const COUNTED = new Set(["Important", "Nit"]);
 const VISIBLE = new Set(["confirmed", "skipped"]);
 
-// findings.json and the verifier's verdicts (verify/<id>/verdict.json) into
-// the parts of the sticky comment post-comment.sh does not write itself:
+function earlierLine(entry) {
+  const where = entry.p
+    ? ` · \`${entry.p.replace(/`/g, "'")}${entry.l ? `:${entry.l}` : ""}\``
+    : "";
+  return `- **${entry.id}** · ${SEVERITY_NAMES[entry.s]}${where} — ${safe(entry.t)} (round ${entry.r})`;
+}
+
+// findings.json, the verifier's verdicts (verify/<id>/verdict.json) and the
+// ledger into the parts of the sticky comment post-comment.sh does not write
+// itself:
 //
 // - summary.md, the first line of the review, which starts with the count of
-//   findings to address (confirmed or, with verification off, unverified;
-//   Important and Nit only, so a pre-existing issue never counts);
-// - body.md, everything after the coverage banners: confirmed findings in
-//   full, pre-existing ones under their own heading, and unconfirmed ones
-//   (refuted, or not verified) below the fold;
+//   open findings to address, this round's and earlier rounds' (confirmed
+//   or, with verification off, unverified; Important and Nit only, so a
+//   pre-existing issue never counts);
+// - body.md, everything after the coverage banners: a paused or empty
+//   round's note, this round's confirmed findings in full, earlier findings
+//   still open, pre-existing issues under their own heading, and unconfirmed
+//   findings (refuted, or not verified) below the fold;
 // - result, "findings" when anything counts, when any finding could not be
-//   verified, or when the review was incomplete, and "clean" otherwise;
+//   verified, or when the review was incomplete or paused, and "clean"
+//   otherwise;
+// - round and ledger.b64, the round count and ledger for the next run; a
+//   round counts only when a review call completed;
 // - review.json, every finding with its verdict, for evals/score.mjs;
 // - inline.json, the review that posts each confirmed finding on its line,
 //   when INLINE_COMMENTS is not "false" and a confirmed finding sits on a
 //   line of the pull request's diff (commentable.json).
 export function render(workDir, env) {
   const read = (name) => (existsSync(join(workDir, name)) ? readFileSync(join(workDir, name), "utf8") : "");
-  const data = readJson(join(workDir, "findings.json")) ?? { findings: [], dropped: {} };
+  const data = readJson(join(workDir, "findings.json")) ?? { findings: [], dropped: {}, still_present: [] };
+  const ledger = readJson(join(workDir, "ledger.json")) ?? emptyLedger();
   const verifierModel = env.VERIFIER_MODEL ?? "";
   const verifierEffort = env.VERIFIER_EFFORT ?? "low";
   const since = read("scope.since").trim();
   const previousResult = read("scope.previous-result").trim();
+  const paused = read("scope.paused").trim() !== "";
   const attempted = Number(read("review.attempted").trim() || "0");
   const completed = Number(read("review.completed").trim() || "0");
+  const previousRound = Number(read("round.previous").trim() || "0");
+  const round = previousRound + (completed > 0 ? 1 : 0);
   const diffPath = join(workDir, "pr.diff");
   const emptyIncremental = since !== "" && (!existsSync(diffPath) || statSync(diffPath).size === 0);
   const unstructuredDir = join(workDir, "unstructured");
@@ -387,28 +550,76 @@ export function render(workDir, env) {
       }
     }
   }
-
   const findings = data.findings;
+  const finderComplete = read("overflow.note").trim() === "" && read("review.failures").trim() === ""
+    && unstructured.length === 0;
+
+  // The ledger after this round. A full review that covered every file
+  // closes each earlier finding it did not report again or name as still
+  // present: it was fixed, or was never real. An incremental, paused or
+  // partial review leaves them as they were.
+  const stillPresent = new Set(data.still_present ?? []);
+  const entries = ledger.f.map((entry) => ({ ...entry }));
+  if (since === "" && !paused && completed > 0 && finderComplete) {
+    for (const entry of entries) {
+      if (entry.o === 1 && !findings.some((f) => f.id === entry.id)) entry.o = stillPresent.has(entry.id) ? 1 : 0;
+    }
+  }
+  for (const finding of findings) {
+    const entry = {
+      id: finding.id,
+      s: SEVERITY_CODES[finding.severity],
+      v: VERDICT_CODES[finding.verdict],
+      r: Math.max(round, 1),
+      o: finding.verdict === "refuted" ? 0 : 1,
+      p: finding.path,
+      l: finding.line,
+      t: oneLine(finding.title, 200),
+    };
+    const index = entries.findIndex((existing) => existing.id === finding.id);
+    if (index >= 0) entries[index] = entry;
+    else entries.push(entry);
+  }
+  // Ids are never reused: the next one is past every id ever handed out.
+  const next = Math.max(data.next ?? 1, ledger.next,
+    ...entries.map((entry) => Number(entry.id.slice(1)) + 1));
+  const updated = trimLedger({ v: 1, next, f: entries });
+  const thisRound = new Set(findings.map((f) => f.id));
+  const earlierOpen = updated.f.filter((entry) => entry.o === 1 && !thisRound.has(entry.id)
+    && (entry.v === "c" || entry.v === "s"));
+
+  const countedEntries = updated.f.filter((entry) => entry.o === 1 && (entry.s === "I" || entry.s === "N")
+    && (entry.v === "c" || entry.v === "s"));
+  const important = countedEntries.filter((entry) => entry.s === "I").length;
+  const nits = countedEntries.length - important;
   const counted = findings.filter((f) => COUNTED.has(f.severity) && VISIBLE.has(f.verdict));
-  const important = counted.filter((f) => f.severity === "Important").length;
-  const nits = counted.length - important;
   const main = findings.filter((f) => f.severity !== "Pre-existing" && VISIBLE.has(f.verdict));
   const preExisting = findings.filter((f) => f.severity === "Pre-existing" && VISIBLE.has(f.verdict));
   const unconfirmed = findings.filter((f) => !VISIBLE.has(f.verdict));
-  const incomplete = ["overflow.note", "review.failures", "verify.failures"]
+  const incomplete = ["overflow.note", "review.failures", "verify.failures", "verify.overflow"]
     .some((name) => read(name).trim() !== "")
     || findings.some((f) => f.verdict === "unverified")
-    || unstructured.length > 0;
-  const carried = since !== "" && previousResult === "findings";
-  const result = counted.length > 0 || incomplete || carried ? "findings" : "clean";
+    || unstructured.length > 0
+    || paused;
+  // A sticky from before the ledger records no findings, so the result of
+  // the review an incremental one builds on stands.
+  const carried = since !== "" && previousResult === "findings" && ledger.f.length === 0;
+  const result = countedEntries.length > 0 || incomplete || carried ? "findings" : "clean";
 
   let summary;
   if (attempted > 0 && completed === 0) {
     summary = `**0 of ${attempted} review ${plural(attempted, "call", "calls")} succeeded**, so nothing was reviewed.`;
   } else {
-    const scope = since !== "" ? ` in the commits since \`${since}\`` : "";
-    summary = `**${counted.length} ${plural(counted.length, "finding", "findings")} to address**${scope}`
-      + (counted.length > 0 ? ` (${important} Important, ${nits} Nit).` : ".");
+    const total = countedEntries.length;
+    summary = `**${total} ${plural(total, "finding", "findings")} to address**`
+      + (total > 0 ? ` (${important} Important, ${nits} Nit)` : "");
+    if (earlierOpen.length > 0 && total > 0) {
+      summary += counted.length === 0
+        ? "; none is new in this review."
+        : `; ${counted.length} ${plural(counted.length, "is", "are")} new in this review.`;
+    } else {
+      summary += ".";
+    }
     if (preExisting.length > 0) {
       summary += ` ${preExisting.length} pre-existing ${plural(preExisting.length, "issue is", "issues are")} listed but not counted.`;
     }
@@ -417,16 +628,30 @@ export function render(workDir, env) {
     }
   }
 
+  const listed = earlierOpen.length > 0 ? "They are listed below." : "This comment's edit history has them.";
   const body = [];
-  if (emptyIncremental) {
-    body.push(previousResult === "clean"
+  if (paused) {
+    const commits = since !== "" ? `the commits since \`${since}\`` : "the commits since the last review";
+    body.push(`> **Review paused** after ${previousRound} rounds - ${commits} were NOT reviewed. `
+      + "Three rounds that each left findings to address usually mean the approach needs another look: "
+      + "reconsider it (split the change, or settle the design with a person) rather than iterating with the reviewer. "
+      + "To start over with a full review, delete this comment and push or re-run.");
+  } else if (emptyIncremental) {
+    body.push(countedEntries.length === 0 && previousResult === "clean"
       ? `_Nothing new to review: the files this pull request changes are the same as at \`${since}\`, and the review of that commit found no issues._`
-      : `_Nothing new to review: the files this pull request changes are the same as at \`${since}\`, so the findings of the review of that commit still apply. This comment's edit history has them._`);
-  } else if (carried && completed > 0 && counted.length === 0) {
-    body.push(`_No new issues in the commits since \`${since}\`, but the findings of the review of that commit were not re-checked and still stand. This comment's edit history has them._`);
+      : `_Nothing new to review: the files this pull request changes are the same as at \`${since}\`, so the findings of the review of that commit still apply. ${listed}_`);
+  } else if (since !== "" && completed > 0 && counted.length === 0
+    && (earlierOpen.length > 0 || carried)) {
+    body.push(`_No new issues in the commits since \`${since}\`, but the findings of the review of that commit were not re-checked and still stand. ${listed}_`);
   }
   if (main.length > 0) {
     body.push("### Findings", ...main.map((f) => findingBlock(f, verifierModel)));
+  }
+  if (earlierOpen.length > 0) {
+    const note = since === "" && !paused && completed > 0
+      ? "_Reported in an earlier round and still present in this review._"
+      : "_Reported in an earlier round and not re-checked by this review._";
+    body.push("### Earlier findings still open", note, earlierOpen.map(earlierLine).join("\n"));
   }
   if (preExisting.length > 0) {
     body.push(
@@ -452,9 +677,12 @@ export function render(workDir, env) {
     );
   }
   const notes = [];
-  const { nits_over_cap: overCap = 0, malformed = 0 } = data.dropped ?? {};
+  const { nits_over_cap: overCap = 0, malformed = 0, repeats = 0 } = data.dropped ?? {};
   if (overCap > 0) {
     notes.push(`${overCap} more ${plural(overCap, "nit was", "nits were")} left out, over the cap of ${data.max_nits} per review.`);
+  }
+  if (repeats > 0) {
+    notes.push(`${repeats} ${plural(repeats, "finding repeated an earlier one and was", "findings repeated earlier ones and were")} left out.`);
   }
   if (malformed > 0) {
     notes.push(`${malformed} ${plural(malformed, "finding", "findings")} without a title ${plural(malformed, "was", "were")} left out.`);
@@ -474,7 +702,10 @@ export function render(workDir, env) {
   writeFileSync(join(workDir, "summary.md"), `${summary}\n`);
   writeFileSync(join(workDir, "body.md"), body.length > 0 ? `${body.join("\n\n")}\n` : "");
   writeFileSync(join(workDir, "result"), `${result}\n`);
-  writeFileSync(join(workDir, "review.json"), `${JSON.stringify({ result, findings }, null, 2)}\n`);
+  writeFileSync(join(workDir, "round"), `${round}\n`);
+  writeFileSync(join(workDir, "ledger.b64"),
+    updated.f.length > 0 || updated.next > 1 ? `${encodeLedger(updated)}\n` : "");
+  writeFileSync(join(workDir, "review.json"), `${JSON.stringify({ result, round, findings }, null, 2)}\n`);
   rmSync(join(workDir, "inline.json"), { force: true });
   if (inline.length > 0 && env.INLINE_COMMENTS !== "false") {
     const head = env.HEAD_SHA ?? "";
@@ -514,6 +745,12 @@ function main(argv) {
       writeFileSync(outPath, `${JSON.stringify(verdict)}\n`);
       return 0;
     }
+    case "ledger-read": {
+      const [workDir] = args;
+      if (!workDir) throw new Error("usage: findings.mjs ledger-read <work dir>");
+      console.log(`earlier findings: ${readLedger(workDir, process.env)}`);
+      return 0;
+    }
     case "render": {
       const [workDir] = args;
       if (!workDir) throw new Error("usage: findings.mjs render <work dir>");
@@ -522,7 +759,7 @@ function main(argv) {
       return 0;
     }
     default:
-      throw new Error("usage: findings.mjs parse|collect|verdict|render ...");
+      throw new Error("usage: findings.mjs parse|collect|verdict|ledger-read|render ...");
   }
 }
 

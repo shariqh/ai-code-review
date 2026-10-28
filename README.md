@@ -17,9 +17,11 @@ It comes in two forms:
 
 Both use high reasoning effort and the long context tier by default, batch
 large diffs at file boundaries, disclose any truncation or failed model calls,
-and never report a failed or partial review as clean. Optionally, later
+and never report a failed or partial review as clean. By default, later
 rounds review only the commits since each reviewer's last review (see
-[Incremental reviews](#incremental-reviews)).
+[Incremental reviews](#incremental-reviews)), no finding is reported twice,
+and a reviewer pauses after three rounds that each left findings (see
+[Rounds and repeats](#rounds-and-repeats)).
 
 ## Copilot token
 
@@ -123,7 +125,8 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context (base branch only; empty disables) |
 | `review-file` | `REVIEW.md` | Repository review guide (base branch only; empty disables) |
 | `full-files-max-bytes` | `60000` | Bytes of the touched files' head versions sent with each batch; `0` leaves them out |
-| `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since each reviewer's last complete review |
+| `review-scope` | `since-last-review` | Review each pull request in full once, then only the commits since each reviewer's last complete review; `full` reviews it whole every time |
+| `max-rounds` | `3` | Pause after this many rounds that left findings; `0` for no cap |
 
 The only secret is `COPILOT_REVIEW_PAT`. Without it, a reviewer job on an
 eligible pull request fails, since `verify-landed` asks for a job that fails
@@ -233,7 +236,8 @@ be present.
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
 | `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
-| `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since this reviewer's last complete review |
+| `review-scope` | `since-last-review` | Review each pull request in full once, then only the commits since this reviewer's last complete review; `full` reviews it whole every time |
+| `max-rounds` | `3` | Pause after this many rounds that left findings; `0` for no cap |
 
 ## What the finder sees
 
@@ -363,11 +367,12 @@ either file is truncated with a note.
 
 ## Incremental reviews
 
-By default every run reviews the whole pull request, so a push that only
-fixes the last round's findings is reviewed in full again. With
-`review-scope: since-last-review`, the first review of a pull request is a
-full review, and each later run reviews only the commits since the head that
-reviewer last reviewed:
+With the default `review-scope: since-last-review`, the first review of a
+pull request is a full review, and each later run reviews only the commits
+since the head that reviewer last reviewed, so a push that only fixes the
+last round's findings is not reviewed in full again. With
+`review-scope: full`, every run reviews the whole pull request. An
+incremental review works like this:
 
 - The previous head is the reviewed commit in the reviewer's own sticky
   comment, never the push event's `before`, so only a review that landed
@@ -380,8 +385,9 @@ reviewer last reviewed:
   is the base branch's current tip, or the event's base SHA when the checkout
   lacks it.
 - The prompt says the review is incremental and lists the files the whole pull
-  request changes (up to 8 KB of names), for orientation. The maintainer
-  review context applies as usual.
+  request changes (up to 8 KB of names), for orientation. The review guide,
+  the maintainer review context and the pull request's description apply as
+  usual.
 - Batching, truncation and failure disclosure work as for a full review.
 
 The run reviews the whole pull request instead, and the job log says why,
@@ -391,8 +397,8 @@ when:
   read;
 - the sticky was written without `since-last-review`, or its header is
   malformed;
-- the last review was incomplete: a review call failed, or coverage was
-  partial;
+- the last review was incomplete: a review or verification call failed,
+  coverage was partial, or the round cap paused it;
 - the last reviewed head is not an ancestor of the new head, as after a
   force-push or rebase, or the checkout lacks it and fetching it fails;
 - the base changed since the last review: the pull request was retargeted to
@@ -423,15 +429,50 @@ and whether the review covered everything
 (`<!-- ai-code-review-coverage: complete -->` or `incomplete`).
 
 An incremental review re-checks only the commits since the last review, so
-findings from before stand until a full review. After a review with findings,
-the `ai-code-review-result` marker stays `findings` even when the new commits
-raise nothing, and the comment says that the earlier findings were not
-re-checked. On an incremental review `clean` therefore means that the review
-it builds on was clean and the commits since raised nothing.
+findings from before stand until a full review. The comment lists them under
+**Earlier findings still open**, they count in its summary line, and the
+`ai-code-review-result` marker stays `findings` even when the new commits
+raise nothing. On an incremental review `clean` therefore means that the
+review it builds on was clean and the commits since raised nothing.
 
 To review a pull request in full again, run with `review-scope: full`. That
 comment records no scope, so the next `since-last-review` run is a full
 review too, and later runs build on it.
+
+## Rounds and repeats
+
+Every comment's header, whatever the scope, also records the round count
+(`<!-- ai-code-review-round: <n> -->`) and a ledger of the findings reported
+so far (`<!-- ai-code-review-ledger: <base64 JSON> -->`): each finding's id,
+severity, verdict, round, file, line and title, and whether it is still
+open. A round is a run in which a review call completed, so a paused run, a
+run with nothing new to review, or one in which every call failed does not
+count. The next run reads both from the reviewer's own sticky.
+
+- **Ids.** Findings are numbered `F1`, `F2`, ... across rounds and never
+  reused, so an id names one finding for the life of the pull request.
+- **No repeats.** The finder's prompt lists the earlier findings that are
+  open or were refuted, and tells it never to report them again. A finding
+  that does anyway, with the same file and title, is left out, and the
+  comment says how many were; one that was not verified is verified again
+  under its old id.
+- **Closing.** An incremental review leaves earlier findings open. A full
+  review that covered every file asks the finder which open findings still
+  apply (`still_present`), keeps those open, and closes the rest as fixed.
+  A full review that left something out closes nothing.
+- **Round cap.** When the last review was round `max-rounds` (3) or later
+  and its result was `findings`, the next run calls no model. Its comment
+  keeps the earlier findings, says the new commits were not reviewed, and
+  asks for the approach to be reconsidered: three rounds that each left
+  findings usually mean the change needs splitting or a design decision from
+  a person, not another round with the reviewer. Its coverage is recorded as
+  incomplete and its result stays `findings`. A round that ended `clean`
+  never pauses the next. To start over, delete the reviewer's sticky comment
+  and push or re-run: the next run is round 1 and a full review. With
+  `max-rounds: 0` there is no cap.
+
+A comment written before the ledger existed has neither line, so the first
+run after upgrading starts at round 1 with no earlier findings.
 
 ## Security model
 
@@ -511,7 +552,12 @@ review too, and later runs build on it.
   anyone with write access to the repository, who can edit the bot's sticky
   or post one as `github-actions[bot]` and so narrow the next review, just as
   they can already read the workflow's secrets; later hardening is tracked in
-  [#7](https://github.com/shariqh/ai-code-review/issues/7).
+  [#7](https://github.com/shariqh/ai-code-review/issues/7). The round count
+  and the ledger of earlier findings come from the same header, for every
+  scope, with the same trust: the ledger is checked field by field and
+  ignored whole when anything is malformed, and its titles reach the prompt
+  only as untrusted data. Someone who edits it can at most make the reviewer
+  skip a finding as a repeat, or pause it early.
 - The PR head is rechecked before the sticky comment changes.
 
 The review is advisory and is not a substitute for human review.

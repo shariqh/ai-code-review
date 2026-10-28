@@ -16,6 +16,18 @@ case "$REVIEW_WORK_DIR" in
   /|""|.) echo "::error::unsafe REVIEW_WORK_DIR"; exit 1 ;;
 esac
 
+# The round cap: after MAX_ROUNDS rounds (0 for no cap) that left findings,
+# the reviewer stops instead of reviewing again. STICKY_ROUND and
+# STICKY_RESULT are the last review's round count and result, from
+# last-review.sh.
+MAX_ROUNDS=${MAX_ROUNDS:-3}
+if ! [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]]; then
+  echo "::error::max-rounds must be a non-negative integer"
+  exit 1
+fi
+round_previous=${STICKY_ROUND:-0}
+[[ "$round_previous" =~ ^[0-9]{1,4}$ ]] || round_previous=0
+
 rm -rf -- "$REVIEW_WORK_DIR"
 mkdir -p "$REVIEW_WORK_DIR"
 
@@ -69,6 +81,11 @@ read_base_file "review context" "$CONTEXT_FILE" "$REVIEW_WORK_DIR/review-context
 # like in this repository, paths to skip, decisions already taken. Read from
 # the base branch for the same reason as the review context.
 read_base_file "review guide" "$REVIEW_FILE" "$REVIEW_WORK_DIR/review-guide.md"
+
+# The findings earlier rounds reported (STICKY_LEDGER), so none is reported
+# again, and the round this one follows.
+node "$GITHUB_ACTION_PATH/scripts/findings.mjs" ledger-read "$REVIEW_WORK_DIR"
+printf '%s\n' "$round_previous" > "$REVIEW_WORK_DIR/round.previous"
 
 # review-scope since-last-review: write the diff of the commits since the head
 # this reviewer last reviewed (LAST_REVIEWED_SHA, found by last-review.sh),
@@ -230,6 +247,21 @@ else
   echo "the pull request's full diff could not be built, so no finding will be posted inline"
   : > "$REVIEW_WORK_DIR/pr-full.diff"
   rm -f "$REVIEW_WORK_DIR/commentable.json"
+fi
+
+# Paused: the last review was round MAX_ROUNDS or later and left findings,
+# and there is something new to review. No model is called; the comment says
+# the new commits were not reviewed and asks for the approach to be
+# reconsidered. Deleting the sticky comment starts over.
+if [ "$MAX_ROUNDS" -gt 0 ] && [ "$round_previous" -ge "$MAX_ROUNDS" ] \
+  && [ "${STICKY_RESULT:-}" = findings ] \
+  && ! { [ -s "$REVIEW_WORK_DIR/scope.since" ] && [ ! -s "$REVIEW_WORK_DIR/pr.diff" ]; }; then
+  printf '%s\n' "$round_previous" > "$REVIEW_WORK_DIR/scope.paused"
+  mkdir -p "$REVIEW_WORK_DIR/batches"
+  : > "$REVIEW_WORK_DIR/overflow.note"
+  echo "0" > "$REVIEW_WORK_DIR/batch.count"
+  echo "review paused: round $round_previous of at most $MAX_ROUNDS left findings, so no model is called"
+  exit 0
 fi
 
 "$GITHUB_ACTION_PATH/scripts/chunk-diff.sh" \

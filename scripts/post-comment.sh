@@ -66,9 +66,16 @@ fi
 # themselves, the result, and the inline review of the confirmed ones.
 node "$GITHUB_ACTION_PATH/scripts/findings.mjs" render "$REVIEW_WORK_DIR"
 result=$(cat result)
-if ! [[ "$result" =~ ^(clean|findings)$ ]]; then
-  echo "::error::the review's result is malformed"
+round=$(cat round)
+ledger=$(cat ledger.b64)
+if ! [[ "$result" =~ ^(clean|findings)$ ]] || ! [[ "$round" =~ ^[0-9]{1,4}$ ]] \
+  || ! [[ "$ledger" =~ ^([A-Za-z0-9+/]+={0,2})?$ ]] || [ "${#ledger}" -gt 24000 ]; then
+  echo "::error::the review's result, round or ledger is malformed"
   exit 1
+fi
+paused=false
+if [ -s scope.paused ]; then
+  paused=true
 fi
 
 marker="<!-- $COMMENT_MARKER -->"
@@ -80,8 +87,9 @@ marker="<!-- $COMMENT_MARKER -->"
   echo
   # An incremental review says so under the reviewed commit, which stays the
   # head so that verify-landed and other readers work unchanged. A full
-  # review adds nothing visible.
-  if [ -n "$since" ]; then
+  # review adds nothing visible, and neither does a paused one, which
+  # reviewed nothing.
+  if [ -n "$since" ] && [ "$paused" = false ]; then
     echo "> **Incremental review** of \`$since..$HEAD_SHA\`; the full review was at \`$full_review\`."
     echo
   fi
@@ -101,6 +109,13 @@ marker="<!-- $COMMENT_MARKER -->"
       echo "<!-- ai-code-review-coverage: incomplete -->"
     fi
   fi
+  # For every scope: the round count and the ledger of the findings reported
+  # so far (sticky_review_fields), for the round cap and so that no finding
+  # is reported twice.
+  echo "<!-- ai-code-review-round: $round -->"
+  if [ -n "$ledger" ]; then
+    echo "<!-- ai-code-review-ledger: $ledger -->"
+  fi
   # The result marker ends the header that sticky_header_fields reads; model
   # output only ever follows it. It is findings when a finding counts, when
   # a finding could not be verified or the review was incomplete, and, for an
@@ -110,10 +125,10 @@ marker="<!-- $COMMENT_MARKER -->"
   echo
   cat summary.md
   echo
-  if [ -s overflow.note ]; then
+  if [ -s overflow.note ] || [ -s verify.overflow ]; then
     echo "> **Partial coverage** - some content was not fully reviewed:"
     echo
-    cat overflow.note
+    cat overflow.note verify.overflow 2>/dev/null || true
     echo
   fi
   if [ -s review.failures ]; then

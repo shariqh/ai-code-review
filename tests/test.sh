@@ -935,6 +935,8 @@ printf '%s\n' '{"findings": [{"severity": "Nit", "path": "src/a.ts", "line": 3,'
   > "$post_work/findings.json"
 : > "$post_work/review.failures"
 : > "$post_work/overflow.note"
+echo 1 > "$post_work/review.attempted"
+echo 1 > "$post_work/review.completed"
 human_quote=$(comment 31 someone "$(printf '%s\n' "<!-- $sol -->" "A human comment.")")
 
 # usage: run_post <fixture dir> [work dir]
@@ -955,11 +957,15 @@ run_post "$fixture" || fail "post-comment.sh failed: $(cat "$fixture/post.out")"
 [ "$(sticky_header_fields < "$fixture/written-body")" = "$verify_head 777 3" ] \
   || fail "the sticky header must carry the commit, run and attempt"
 
-# With review-scope full there is no scope record. The summary line comes
-# first and starts with the count, and the findings are rendered once.
+# With review-scope full there is no scope record, only the round and the
+# ledger of findings. The summary line comes first and starts with the count,
+# and the findings are rendered once.
+post_ledger=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64"))' \
+  '{"v":1,"next":2,"f":[{"id":"F1","s":"N","v":"s","r":1,"o":1,"p":"src/a.ts","l":3,"t":"A finding."}]}')
 printf '%s\n' "<!-- $sol -->" "## AI code review (\`gpt-5.6-sol\` via Copilot CLI)" "" \
   "_Reviewed commit: \`$verify_head\`_" "" "<!-- ai-code-review-run: 777 -->" \
-  "<!-- ai-code-review-attempt: 3 -->" "<!-- ai-code-review-result: findings -->" "" \
+  "<!-- ai-code-review-attempt: 3 -->" "<!-- ai-code-review-round: 1 -->" \
+  "<!-- ai-code-review-ledger: $post_ledger -->" "<!-- ai-code-review-result: findings -->" "" \
   "**1 finding to address** (0 Important, 1 Nit)." "" "### Findings" "" \
   "#### F1 · Nit · \`src/a.ts:3\`" "**A finding.**" "" "_Not verified: verification is off._" "" \
   "_Verification is off, so no finding is posted inline._" "" \
@@ -1004,9 +1010,9 @@ MAX_NITS=2 MAX_VERIFICATIONS=3 VERIFIER_MODEL=gpt-5.6-sol \
   = '[["F1","Important","Bug one","pending"],["F2","Nit","Nit one","pending"],["F3","Nit","Nit two","pending"],["F4","Pre-existing","Old bug","over-cap"]]' ] \
   || fail "unexpected collected findings: $(jq -c . "$collect_work/findings.json")"
 [ "$(jq -c .dropped "$collect_work/findings.json")" \
-  = '{"duplicates":1,"malformed":1,"nits_over_cap":1}' ] \
+  = '{"duplicates":1,"malformed":1,"nits_over_cap":1,"repeats":0}' ] \
   || fail "unexpected dropped counts: $(jq -c .dropped "$collect_work/findings.json")"
-assert_contains "$collect_work/overflow.note" \
+assert_contains "$collect_work/verify.overflow" \
   "verification cap (3) reached: 1 finding was NOT verified and is listed below the fold"
 VERIFIER_MODEL='' node "$ROOT/scripts/findings.mjs" collect "$collect_work" > /dev/null
 [ "$(jq -r '[.findings[].verify] | unique | join(",")' "$collect_work/findings.json")" = off ] \
@@ -1432,6 +1438,13 @@ prepare_since() {
     "$@" "$ROOT/scripts/prepare-review.sh" > "$work.log" 2>&1
 }
 
+# The outputs an incremental review builds on, without the round, ledger
+# and last result that last-review.sh hands on for every review.
+# usage: incremental_outputs <last-review.out>
+incremental_outputs() {
+  grep -E '^(reviewed-commit|full-review|result|base-ref|merge-base)=' "$1" || true
+}
+
 # usage: run_last_review <fixture dir>
 run_last_review() {
   : > "$1/last-review.out"
@@ -1463,6 +1476,9 @@ scope_round() {
     LAST_REVIEW_RESULT="$(sed -n 's/^result=//p' "$dir/last-review.out")" \
     LAST_BASE_REF="$(sed -n 's/^base-ref=//p' "$dir/last-review.out")" \
     LAST_MERGE_BASE="$(sed -n 's/^merge-base=//p' "$dir/last-review.out")" \
+    STICKY_ROUND="$(sed -n 's/^round=//p' "$dir/last-review.out")" \
+    STICKY_LEDGER="$(sed -n 's/^ledger=//p' "$dir/last-review.out")" \
+    STICKY_RESULT="$(sed -n 's/^last-result=//p' "$dir/last-review.out")" \
     "$@" || fail "prepare-review.sh failed: $(cat "$dir/work.log")"
   PATH="$bin:$PATH" COPILOT_GITHUB_TOKEN=stub-token REVIEW_WORK_DIR="$dir/work" \
   REVIEW_MODEL=gpt-5.6-sol VERIFIER_MODEL=gpt-5.6-sol GITHUB_ACTION_PATH="$ROOT" \
@@ -1481,6 +1497,7 @@ scope_round() {
     "$ROOT/scripts/post-comment.sh" > "$dir/post.log" 2>&1 \
     || fail "post-comment.sh failed: $(cat "$dir/post.log")"
   cp "$fixture/written-body" "$dir/sticky.md"
+  cp "$fixture/writes" "$dir/writes"
 }
 
 # usage: expect_scope_line <sticky file> <since> <head> <full review>
@@ -1510,7 +1527,7 @@ r1="$TEMP_DIR/round1"
 scope_round "$r1" "$head1" "$stub_bin" -
 assert_contains "$r1/last-review.log" \
   "review scope: full review, because this reviewer has not reviewed this pull request yet"
-[ ! -s "$r1/last-review.out" ] || fail "a first run handed on a previous head"
+[ ! -s "$r1/last-review.out" ] || fail "a first run handed on a previous review"
 expect_full_review "$r1" "$head1"
 if grep -Fiq "incremental" "$r1/work/prompt.txt"; then
   fail "a full review's prompt must not mention an incremental review"
@@ -1522,7 +1539,7 @@ fi
 # the PR's file list (quoted, one name per line) and the maintainer context.
 r2="$TEMP_DIR/round2"
 scope_round "$r2" "$head2" "$stub_bin" "$r1/sticky.md"
-[ "$(cat "$r2/last-review.out")" \
+[ "$(incremental_outputs "$r2/last-review.out")" \
   = "$(printf '%s\n' "reviewed-commit=$head1" "full-review=$head1" "result=clean" \
     "base-ref=main" "merge-base=$scope_base")" ] \
   || fail "unexpected last review: $(cat "$r2/last-review.out")"
@@ -1619,7 +1636,7 @@ assert_contains "$r3_empty_findings/sticky.md" \
 r4_carried="$TEMP_DIR/round4-findings-carried"
 scope_round "$r4_carried" "$head4" "$stub_bin" "$r2_findings/sticky.md"
 assert_contains "$r4_carried/sticky.md" \
-  "_No new issues in the commits since \`$head2\`, but the findings of the review of that commit were not re-checked and still stand. This comment's edit history has them._"
+  "_No new issues in the commits since \`$head2\`, but the findings of the review of that commit were not re-checked and still stand. They are listed below._"
 if grep -Fq "No issues found." "$r4_carried/sticky.md"; then
   fail "a clean round after findings was reported as a clean review"
 fi
@@ -1627,8 +1644,164 @@ expect_scope_line "$r4_carried/sticky.md" "$head2" "$head4" "$head1"
 [ "$(sticky_scope_fields < "$r4_carried/sticky.md")" = "findings $head1 complete main $main1" ] \
   || fail "a clean incremental round must keep an earlier findings result"
 r5_cleared="$TEMP_DIR/round5-findings-cleared"
-scope_round "$r5_cleared" "$head2b" "$stub_bin" "$r4_carried/sticky.md"
+scope_round "$r5_cleared" "$head2b" "$stub_bin" "$r4_carried/sticky.md" MAX_ROUNDS=0
 expect_full_review "$r5_cleared" "$head2b"
+
+# The round cap. r2_findings and r4_carried were rounds 2 and 3, and both left
+# findings, so the next push pauses: no model is called, the new commits are
+# said not to be reviewed, the result stays findings and the coverage
+# incomplete, the round stays 3, and verify-landed accepts the sticky.
+scope_git checkout -q "$head4"
+cap_head=$(scope_commit a.txt "after three rounds")
+cap_head2=$(scope_commit a.txt "after the pause")
+r_paused="$TEMP_DIR/round-paused"
+scope_round "$r_paused" "$cap_head" "$finding_bin" "$r4_carried/sticky.md"
+[ "$(sticky_review_fields < "$r4_carried/sticky.md" | cut -d' ' -f1)" = 3 ] \
+  || fail "the third round must record round 3"
+[ "$(cat "$r_paused/work/review.attempted")" = 0 ] || fail "a paused review called the model"
+assert_contains "$r_paused/work.log" "review paused: round 3 of at most 3 left findings"
+assert_contains "$r_paused/sticky.md" \
+  "> **Review paused** after 3 rounds - the commits since \`$head4\` were NOT reviewed."
+assert_contains "$r_paused/sticky.md" "reconsider it (split the change, or settle the design with a person)"
+[ "$(sticky_scope_fields < "$r_paused/sticky.md" | cut -d' ' -f1,3)" = "findings incomplete" ] \
+  || fail "a paused review must keep findings and be incomplete: $(sticky_scope_fields < "$r_paused/sticky.md")"
+[ "$(sticky_review_fields < "$r_paused/sticky.md" | cut -d' ' -f1)" = 3 ] \
+  || fail "a paused review must not count as a round"
+if grep -Fq "Incremental review" "$r_paused/sticky.md"; then
+  fail "a paused review must not claim an incremental review"
+fi
+assert_contains "$r_paused/sticky.md" "- **F1** · Important · \`a.txt:1\` — A finding. (round 2)"
+fixture=$(gh_fixture "$cap_head" "$(comment 50 "$bot" "$(cat "$r_paused/sticky.md")")")
+PATH="$gh_bin:$PATH" STUB_DIR="$fixture" GH_TOKEN=stub REPOSITORY=shariqh/example \
+PR_NUMBER=7 HEAD_SHA="$cap_head" RUN_ID=900 RUN_ATTEMPT=1 COMMENT_MARKER="$sol" \
+GITHUB_ACTION_PATH="$ROOT" "$ROOT/scripts/verify-landed.sh" > "$fixture/verify.out" 2>&1 \
+  || fail "verify-landed rejected a paused sticky: $(cat "$fixture/verify.out")"
+# It stays paused on the next push, and max-rounds 0 lifts the cap.
+r_paused_again="$TEMP_DIR/round-paused-again"
+scope_round "$r_paused_again" "$cap_head2" "$finding_bin" "$r_paused/sticky.md"
+[ "$(cat "$r_paused_again/work/review.attempted")" = 0 ] || fail "the next push after a pause was reviewed"
+r_uncapped="$TEMP_DIR/round-uncapped"
+scope_round "$r_uncapped" "$cap_head" "$stub_bin" "$r4_carried/sticky.md" MAX_ROUNDS=0
+[ "$(cat "$r_uncapped/work/review.attempted")" = 1 ] || fail "max-rounds 0 must not pause"
+[ "$(sticky_review_fields < "$r_uncapped/sticky.md" | cut -d' ' -f1)" = 4 ] \
+  || fail "the fourth review must record round 4"
+# A round that ended clean never pauses the next one.
+r_clean_cap="$TEMP_DIR/round-clean-cap"
+scope_round "$r_clean_cap" "$head2" "$stub_bin" "$r1/sticky.md" MAX_ROUNDS=1
+[ "$(cat "$r_clean_cap/work/review.attempted")" = 1 ] || fail "a clean last round paused the review"
+
+# Never a repeat. The finder reports the same finding again in the next
+# incremental round: it is left out, nothing is posted inline, and the
+# earlier finding stays open. The prompt listed it, without asking for
+# still_present, which only a full review can judge.
+r_repeat="$TEMP_DIR/round-repeat"
+scope_round "$r_repeat" "$head4" "$finding_bin" "$r2_findings/sticky.md"
+assert_contains "$r_repeat/work/prompt.txt" "--- BEGIN EARLIER FINDINGS ---"
+grep -Fxq '| F1 [Important, confirmed, open] a.txt:1 - A finding.' "$r_repeat/work/prompt.txt" \
+  || fail "the prompt must list the earlier finding"
+if grep -Fq 'still_present' "$r_repeat/work/prompt.txt"; then
+  fail "an incremental review must not ask which earlier findings still apply"
+fi
+assert_contains "$r_repeat/sticky.md" "1 finding repeated an earlier one and was left out."
+if grep -q '^#### F' "$r_repeat/sticky.md"; then
+  fail "a repeated finding was reported again"
+fi
+[ "$(grep -c 'pulls/7/reviews' "$r_repeat/writes")" = 0 ] || fail "a repeated finding was posted inline again"
+[ "$(sticky_scope_fields < "$r_repeat/sticky.md" | cut -d' ' -f1)" = findings ] \
+  || fail "the earlier finding must keep the result findings"
+
+# A full review, here after a force-push, keeps an earlier finding open when
+# the finder names it in still_present, and closes it when the finder does
+# not report it again (r5_cleared above).
+still_bin="$TEMP_DIR/still-bin"
+mkdir -p "$still_bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+  "printf '%s\\n' '\`\`\`json' '{\"findings\": [], \"still_present\": [\"F1\", \"F9\"]}' '\`\`\`'" \
+  > "$still_bin/copilot"
+chmod +x "$still_bin/copilot"
+r_still="$TEMP_DIR/round-still-present"
+scope_round "$r_still" "$head2b" "$still_bin" "$r2_findings/sticky.md"
+assert_contains "$r_still/work/prompt.txt" 'This is a full review: if an open one still applies'
+assert_contains "$r_still/sticky.md" "_Reported in an earlier round and still present in this review._"
+assert_contains "$r_still/sticky.md" "**1 finding to address** (1 Important, 0 Nit); none is new in this review."
+[ "$(sticky_scope_fields < "$r_still/sticky.md" | cut -d' ' -f1)" = findings ] \
+  || fail "a finding still present must keep the result findings"
+[ "$(sticky_scope_fields < "$r5_cleared/sticky.md" | cut -d' ' -f1)" = clean ] \
+  || fail "a complete full review that no longer reports a finding must close it"
+
+# A finding that could not be verified is verified again, under the same id,
+# when the next review reports it again: the failed verification made the
+# last review incomplete, so this one is full.
+unverified_bin="$TEMP_DIR/unverified-bin"
+mkdir -p "$unverified_bin"
+cat > "$unverified_bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+case "$2" in
+  "You are checking one finding"*) echo "Error: verifier down" >&2; exit 1 ;;
+  *) printf '%s\n' '```json' \
+    '{"findings": [{"severity": "Important", "path": "a.txt", "line": 1, "title": "A finding."}]}' \
+    '```' ;;
+esac
+STUB
+chmod +x "$unverified_bin/copilot"
+r_unverified="$TEMP_DIR/round-unverified"
+scope_round "$r_unverified" "$head1" "$unverified_bin" -
+[ "$(sticky_scope_fields < "$r_unverified/sticky.md" | cut -d' ' -f1,3)" = "findings incomplete" ] \
+  || fail "an unverified finding must leave the review incomplete"
+r_reverified="$TEMP_DIR/round-reverified"
+scope_round "$r_reverified" "$head2" "$finding_bin" "$r_unverified/sticky.md"
+expect_full_review_diff() {
+  git -C "$scope_repo" diff "$scope_base...$2" > "$1/full.diff"
+  cmp -s "$1/full.diff" "$1/work/pr.diff" || fail "$1 did not review the whole pull request"
+}
+expect_full_review_diff "$r_reverified" "$head2"
+grep -q '^#### F1 · Important · `a.txt:1`$' "$r_reverified/sticky.md" \
+  || fail "the re-verified finding must keep its id"
+assert_contains "$r_reverified/sticky.md" "_Confirmed by \`gpt-5.6-sol\`: a.txt line 1 shows it_"
+[ "$(grep -c 'pulls/7/reviews' "$r_reverified/writes")" = 1 ] \
+  || fail "a finding confirmed on re-verification must be posted inline"
+
+# The ledger comes from a comment anyone with write access can edit, so a
+# malformed one is ignored rather than trusted.
+# usage: ledger_of <json>
+ledger_of() {
+  node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64"))' "$1"
+}
+ledger_work="$TEMP_DIR/ledger-work"
+mkdir -p "$ledger_work"
+good_entry='{"id":"F1","s":"I","v":"c","r":1,"o":1,"p":"a.txt","l":1,"t":"A finding."}'
+for bad_ledger in 'not base64!' "$(ledger_of 'not json')" \
+  "$(ledger_of '{"v":2,"next":2,"f":[]}')" \
+  "$(ledger_of "{\"v\":1,\"next\":1,\"f\":[$good_entry]}")" \
+  "$(ledger_of "{\"v\":1,\"next\":3,\"f\":[$good_entry,$good_entry]}")" \
+  "$(ledger_of '{"v":1,"next":2,"f":[{"id":"F1","s":"X","v":"c","r":1,"o":1,"p":"a","l":1,"t":"t"}]}')" \
+  "$(ledger_of '{"v":1,"next":2,"f":[{"id":"F1","s":"I","v":"c","r":1,"o":1,"p":"a","l":0,"t":"t"}]}')" \
+  "$(ledger_of "{\"v\":1,\"next\":2,\"f\":[{\"id\":\"F1\",\"s\":\"I\",\"v\":\"c\",\"r\":1,\"o\":1,\"p\":\"a\",\"l\":1,\"t\":\"$(repeat_char 201 t)\"}]}")"; do
+  STICKY_LEDGER="$bad_ledger" node "$ROOT/scripts/findings.mjs" ledger-read "$ledger_work" \
+    > "$ledger_work.log"
+  assert_contains "$ledger_work.log" "earlier findings: malformed, so this review starts a new one"
+  [ "$(cat "$ledger_work/ledger.json")" = '{"v":1,"next":1,"f":[]}' ] \
+    || fail "a malformed ledger was trusted: $bad_ledger"
+  [ ! -s "$ledger_work/earlier-findings.txt" ] || fail "a malformed ledger reached the prompt"
+done
+STICKY_LEDGER="$(ledger_of "{\"v\":1,\"next\":2,\"f\":[$good_entry]}")" \
+  node "$ROOT/scripts/findings.mjs" ledger-read "$ledger_work" > "$ledger_work.log"
+assert_contains "$ledger_work.log" "earlier findings: 1 earlier finding"
+
+# With review-scope full, the last review's round, ledger and result are
+# still handed on, but nothing an incremental review builds on, and nothing
+# is said about the scope.
+fixture=$(gh_fixture "$head2" "$(comment 50 "$bot" "$(cat "$r2_findings/sticky.md")")")
+: > "$fixture/last-review.out"
+PATH="$gh_bin:$PATH" STUB_DIR="$fixture" GH_TOKEN=stub REPOSITORY=shariqh/example PR_NUMBER=7 \
+COMMENT_MARKER="$sol" GITHUB_ACTION_PATH="$ROOT" GITHUB_OUTPUT="$fixture/last-review.out" \
+REVIEW_SCOPE=full "$ROOT/scripts/last-review.sh" > "$fixture/last-review.log" 2>&1 \
+  || fail "last-review.sh failed under review-scope full: $(cat "$fixture/last-review.log")"
+[ "$(cut -d= -f1 "$fixture/last-review.out" | tr '\n' ' ')" = "round ledger last-result " ] \
+  || fail "unexpected outputs under review-scope full: $(cat "$fixture/last-review.out")"
+if grep -Fq "review scope:" "$fixture/last-review.log"; then
+  fail "review-scope full must say nothing about an incremental review"
+fi
 
 # Fallback to a full review after a force-push, a failed review or a partial
 # one. A full review starts a new chain: later runs name it as the full one.
@@ -1723,14 +1896,14 @@ on_main="main $scope_base"
 # usage: expect_no_last_review <label> <reason> <fixture dir>
 expect_no_last_review() {
   run_last_review "$3" || fail "last-review.sh failed on $1: $(cat "$3/last-review.log")"
-  [ ! -s "$3/last-review.out" ] || fail "last-review.sh built on $1"
+  [ -z "$(incremental_outputs "$3/last-review.out")" ] || fail "last-review.sh built on $1"
   assert_contains "$3/last-review.log" "review scope: full review, because $2"
 }
 
 fixture=$(gh_fixture "$head2" "$(comment 50 "$bot" \
   "$(scope_sticky_body "$sol" "$head2" "$head1" complete findings "$on_main")")")
 run_last_review "$fixture" || fail "last-review.sh failed: $(cat "$fixture/last-review.log")"
-[ "$(cat "$fixture/last-review.out")" \
+[ "$(incremental_outputs "$fixture/last-review.out")" \
   = "$(printf '%s\n' "reviewed-commit=$head2" "full-review=$head1" "result=findings" \
     "base-ref=main" "merge-base=$scope_base")" ] \
   || fail "a valid sticky was not built on: $(cat "$fixture/last-review.log")"
@@ -1934,13 +2107,16 @@ for script in run-review.sh verify-findings.sh; do
   fi
 done
 
-# review-scope defaults to full, and only since-last-review reads the sticky,
-# before the batches are built.
+# review-scope defaults to since-last-review and rounds are capped at three.
+# Every scope reads the sticky (for the round, the earlier findings and the
+# last result), before the batches are built.
 assert_contains "$ROOT/action.yml" "REVIEW_SCOPE: \${{ inputs.review-scope }}"
-assert_contains "$ROOT/action.yml" \
-  "if: steps.guard.outputs.skip == 'false' && inputs.review-scope == 'since-last-review'"
-[ "$(grep -A7 '^  review-scope:$' "$ROOT/action.yml" | grep -c '^    default: full$')" = "1" ] \
-  || fail "the action's review-scope must default to full"
+[ "$(grep -A3 "name: Find this reviewer's last review" "$ROOT/action.yml" | grep -c "^      if: steps.guard.outputs.skip == 'false'$")" = 1 ] \
+  || fail "the last review must be read for every review scope"
+[ "$(grep -A7 '^  review-scope:$' "$ROOT/action.yml" | grep -c '^    default: since-last-review$')" = "1" ] \
+  || fail "the action's review-scope must default to since-last-review"
+[ "$(grep -A7 '^  max-rounds:$' "$ROOT/action.yml" | grep -c '^    default: "3"$')" = "1" ] \
+  || fail "the action's max-rounds must default to 3"
 last_review_line=$(grep -n "name: Find this reviewer's last review" "$ROOT/action.yml" | cut -d: -f1)
 build_line=$(grep -n 'name: Build review batches' "$ROOT/action.yml" | cut -d: -f1)
 [ "$last_review_line" -lt "$build_line" ] \
@@ -1959,8 +2135,9 @@ assert_contains "$workflow" "uses: ./.ai-code-review-action"
 assert_contains "$workflow" "verify-landed: \${{ inputs.verify-landed }}"
 assert_contains "$workflow" "allow-missing-token: \${{ inputs.allow-missing-token }}"
 assert_contains "$workflow" "review-scope: \${{ inputs.review-scope }}"
-[ "$(grep -A7 '^      review-scope:$' "$workflow" | grep -c '^        default: full$')" = "1" ] \
-  || fail "the workflow's review-scope must default to full"
+[ "$(grep -A7 '^      review-scope:$' "$workflow" | grep -c '^        default: since-last-review$')" = "1" ] \
+  || fail "the workflow's review-scope must default to since-last-review"
+assert_contains "$workflow" "max-rounds: \${{ inputs.max-rounds }}"
 # The no-token smoke jobs opt out explicitly; without that they would fail.
 [ "$(grep -c 'allow-missing-token: true' "$ROOT/.github/workflows/test.yml")" = "2" ] \
   || fail "both no-token smoke jobs must set allow-missing-token"

@@ -5,8 +5,8 @@ review comment on the PR for each reviewer model.
 
 It comes in two forms:
 
-- a **reusable workflow** (`.github/workflows/review.yml`) that runs several
-  reviewers in parallel, by default `gpt-5.6-sol` and `gpt-6-astra`, and
+- a **reusable workflow** (`.github/workflows/review.yml`) that runs one or
+  more reviewers in parallel, by default just `gpt-6-astra`, and
   fails a reviewer's job when its review did not land on the PR's current
   head;
 - the **composite action** (`action.yml`) it is built on, for a single
@@ -43,7 +43,7 @@ review checks out the PR head only as data and never executes repository code.
 Pin the call to a release commit SHA:
 
 ```yaml
-uses: shariqh/ai-code-review/.github/workflows/review.yml@<commit-sha> # v1.2.0
+uses: shariqh/ai-code-review/.github/workflows/review.yml@<commit-sha> # v1.4.0
 ```
 
 Each reviewer job checks out this repository at the commit it was called at
@@ -70,17 +70,26 @@ not stop the others.
 | `reasoning-effort` | no | Overrides the `reasoning-effort` input |
 | `context` | no | Overrides the `context` input |
 
-The default is:
+The default is one reviewer, Astra:
 
 ```json
 [
-  {"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"},
   {"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra", "timeout-minutes": 40}
 ]
 ```
 
+To run a second reviewer, pass the full list through `reviewers`, keeping the
+default entry and adding another, for example Sol:
+
+```yaml
+with:
+  reviewers: >-
+    [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra", "timeout-minutes": 40},
+    {"name": "Sol", "model": "gpt-5.6-sol", "marker": "ai-code-review-sticky"}]
+```
+
 Keep the reviewers non-Claude when they review Claude-authored code; an
-independent model is the point of the second opinion. GitHub names each
+independent model is the point of the outside opinion. GitHub names each
 check `<calling job> / <reviewer name>`, for example `review / Astra`.
 
 ### Workflow inputs
@@ -88,7 +97,7 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `runs-on` | `ubuntu-latest` | Runner label, or JSON such as `["self-hosted","copilot-review"]` |
-| `reviewers` | Sol and Astra (above) | Reviewer list |
+| `reviewers` | Astra alone (above) | Reviewer list |
 | `timeout-minutes` | `20` | Job timeout for reviewers without their own |
 | `cancel-in-progress` | `false` | Cancel a reviewer's running job when a newer push arrives |
 | `verify-landed` | `true` | Fail a job whose sticky comment does not cover the current head from this run attempt |

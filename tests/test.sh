@@ -1428,7 +1428,7 @@ assert_contains "$workflow" "review-scope: \${{ inputs.review-scope }}"
 [ "$(grep -c 'allow-missing-token: true' "$ROOT/.github/workflows/test.yml")" = "2" ] \
   || fail "both no-token smoke jobs must set allow-missing-token"
 default_models=$(node "$ROOT/tests/check-default-reviewers.mjs" "$workflow")
-[ "$default_models" = "gpt-5.6-sol,gpt-6-astra" ] \
+[ "$default_models" = "gpt-6-astra" ] \
   || fail "unexpected default reviewers: $default_models"
 assert_contains "$ROOT/examples/reusable-workflow.yml" "pull_request_target:"
 assert_contains "$ROOT/examples/reusable-workflow.yml" \

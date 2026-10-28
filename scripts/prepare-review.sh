@@ -208,6 +208,19 @@ if [ "$incremental" = false ]; then
 fi
 echo "diff bytes: $(wc -c < "$REVIEW_WORK_DIR/pr.diff")"
 
+# The pull request's whole diff, against the same trusted base, as GitHub
+# shows it: the verifier reads what the pull request changes in a file from
+# it, and an inline comment can sit only on a line of one of its hunks.
+if git -C "$REVIEW_REPO_DIR" diff "$context_rev...$HEAD_SHA" > "$REVIEW_WORK_DIR/pr-full.diff" \
+  && node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" commentable \
+    "$REVIEW_WORK_DIR/pr-full.diff" "$REVIEW_WORK_DIR/commentable.json"; then
+  :
+else
+  echo "the pull request's full diff could not be built, so no finding will be posted inline"
+  : > "$REVIEW_WORK_DIR/pr-full.diff"
+  rm -f "$REVIEW_WORK_DIR/commentable.json"
+fi
+
 "$GITHUB_ACTION_PATH/scripts/chunk-diff.sh" \
   "$REVIEW_WORK_DIR/pr.diff" \
   "$REVIEW_WORK_DIR"

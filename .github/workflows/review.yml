@@ -22,8 +22,8 @@ on:
         description: >-
           JSON array with one entry per reviewer (Astra alone by default). Each entry needs a model and
           a marker that no other reviewer uses, and may set name (the job
-          name, defaulting to the model), timeout-minutes, reasoning-effort
-          and context.
+          name, defaulting to the model), timeout-minutes, reasoning-effort,
+          context, verifier-model and verifier-effort.
         type: string
         default: >-
           [{"name": "Astra", "model": "gpt-6-astra", "marker": "ai-code-review-sticky-astra",
@@ -68,6 +68,29 @@ on:
         description: Context tier for reviewers that do not set their own
         type: string
         default: long_context
+      verifier-model:
+        description: >-
+          Verifier model for reviewers that do not set their own: it checks
+          each finding against the code before it is posted. An empty string
+          turns verification off.
+        type: string
+        default: gpt-5.6-sol
+      verifier-effort:
+        description: Verifier reasoning effort for reviewers that do not set their own
+        type: string
+        default: low
+      max-verifications:
+        description: Maximum verifier calls per reviewer per run, one per finding
+        type: number
+        default: 10
+      max-nits:
+        description: Maximum findings of severity Nit per review
+        type: number
+        default: 3
+      inline-comments:
+        description: Post each confirmed finding as an inline review comment
+        type: boolean
+        default: true
       batch-max-bytes:
         description: Target maximum bytes per review batch
         type: number
@@ -162,6 +185,11 @@ jobs:
           comment-marker: ${{ matrix.reviewer.marker }}
           reasoning-effort: ${{ matrix.reviewer.reasoning-effort || inputs.reasoning-effort }}
           context: ${{ matrix.reviewer.context || inputs.context }}
+          verifier-model: ${{ matrix.reviewer.verifier-model || inputs.verifier-model }}
+          verifier-effort: ${{ matrix.reviewer.verifier-effort || inputs.verifier-effort }}
+          max-verifications: ${{ inputs.max-verifications }}
+          max-nits: ${{ inputs.max-nits }}
+          inline-comments: ${{ inputs.inline-comments }}
           copilot-cli-version: ${{ inputs.copilot-cli-version }}
           node-version: ${{ inputs.node-version }}
           batch-max-bytes: ${{ inputs.batch-max-bytes }}

@@ -9,9 +9,34 @@ inputs:
     description: Caller repository GITHUB_TOKEN used to manage the sticky comment
     required: true
   model:
-    description: Copilot CLI model identifier
+    description: Copilot CLI model identifier of the finder
     required: false
     default: gpt-5.6-sol
+  verifier-model:
+    description: >-
+      Copilot CLI model identifier of the verifier, which checks each finding
+      against the code before it is posted. Empty turns verification off:
+      findings are then listed unverified and none is posted inline.
+    required: false
+    default: gpt-5.6-sol
+  verifier-effort:
+    description: Reasoning effort passed to Copilot CLI for the verifier
+    required: false
+    default: low
+  max-verifications:
+    description: Maximum verifier calls per run, one per finding
+    required: false
+    default: "10"
+  max-nits:
+    description: Maximum findings of severity Nit reported per review
+    required: false
+    default: "3"
+  inline-comments:
+    description: >-
+      Post each confirmed finding as an inline review comment on its line, in
+      addition to the sticky comment
+    required: false
+    default: "true"
   copilot-cli-version:
     description: Exact @github/copilot package version
     required: false
@@ -103,6 +128,11 @@ runs:
         ALLOW_MISSING_TOKEN: ${{ inputs.allow-missing-token }}
         REVIEW_SCOPE: ${{ inputs.review-scope }}
         REVIEW_MODEL: ${{ inputs.model }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
+        MAX_NITS: ${{ inputs.max-nits }}
+        INLINE_COMMENTS: ${{ inputs.inline-comments }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
         COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
         REVIEW_GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -183,7 +213,35 @@ runs:
         REVIEW_MODEL: ${{ inputs.model }}
         REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         CONTEXT_TIER: ${{ inputs.context }}
+        MAX_NITS: ${{ inputs.max-nits }}
+        MAX_VERIFICATIONS: ${{ inputs.max-verifications }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
       run: "$GITHUB_ACTION_PATH/scripts/run-review.sh"
+
+    # Reads the checkout, so it runs without the Copilot token: the head
+    # version of each file a finding names, what the pull request changes in
+    # it, and where the identifiers the finding names appear.
+    - name: Gather verification evidence
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        REVIEW_REPO_DIR: ${{ github.workspace }}/.ai-code-review-pr-${{ github.run_id }}-${{ github.run_attempt }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: >-
+        node "$GITHUB_ACTION_PATH/scripts/review-files.mjs" verify-context
+        "$REVIEW_WORK_DIR" "$REVIEW_REPO_DIR" "$HEAD_SHA"
+
+    - name: Verify findings
+      if: steps.guard.outputs.skip == 'false'
+      shell: bash
+      env:
+        COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
+        REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        CONTEXT_TIER: ${{ inputs.context }}
+      run: "$GITHUB_ACTION_PATH/scripts/verify-findings.sh"
 
     - name: Post sticky review comment
       if: steps.guard.outputs.skip == 'false'
@@ -197,11 +255,14 @@ runs:
         RUN_ID: ${{ github.run_id }}
         RUN_ATTEMPT: ${{ github.run_attempt }}
         REVIEW_MODEL: ${{ inputs.model }}
+        VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        INLINE_COMMENTS: ${{ inputs.inline-comments }}
         REVIEW_WORK_DIR: ${{ runner.temp }}/ai-code-review-${{ github.run_id }}-${{ github.run_attempt }}
         COMMENT_MARKER: ${{ inputs.comment-marker }}
       run: "$GITHUB_ACTION_PATH/scripts/post-comment.sh"
 
-    - name: Fail when every review call failed
+    - name: Fail when every review or verification call failed
       if: steps.guard.outputs.skip == 'false'
       shell: bash
       env:

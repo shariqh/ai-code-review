@@ -1,7 +1,10 @@
 # AI code review
 
 Reviews pull request diffs with GitHub Copilot CLI and maintains a sticky
-review comment on the PR for each reviewer model.
+review comment on the PR for each reviewer model. A finder model reports
+findings in a fixed severity vocabulary, a second, cheaper call checks each
+one against the code, and only confirmed findings are posted as inline review
+comments (see [Findings and verification](#findings-and-verification)).
 
 It comes in two forms:
 
@@ -69,6 +72,8 @@ not stop the others.
 | `timeout-minutes` | no | Job timeout, defaulting to the `timeout-minutes` input |
 | `reasoning-effort` | no | Overrides the `reasoning-effort` input |
 | `context` | no | Overrides the `context` input |
+| `verifier-model` | no | Overrides the `verifier-model` input |
+| `verifier-effort` | no | Overrides the `verifier-effort` input |
 
 The default is one reviewer, Astra:
 
@@ -106,9 +111,14 @@ check `<calling job> / <reviewer name>`, for example `review / Astra`.
 | `node-version` | `lts/*` | Node.js version |
 | `reasoning-effort` | `high` | Model reasoning effort |
 | `context` | `long_context` | Model context tier |
+| `verifier-model` | `gpt-5.6-sol` | Model that checks each finding; empty turns verification off |
+| `verifier-effort` | `low` | Verifier reasoning effort |
+| `max-verifications` | `10` | Maximum verifier calls per reviewer, one per finding |
+| `max-nits` | `3` | Maximum Nit findings per review |
+| `inline-comments` | `true` | Post each confirmed finding as an inline review comment |
 | `batch-max-bytes` | `50000` | Target batch size |
 | `file-max-bytes` | `120000` | Per-file review cap |
-| `max-batches` | `8` | Maximum model calls per reviewer |
+| `max-batches` | `8` | Maximum finder calls per reviewer |
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context (base branch only; empty disables) |
 | `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since each reviewer's last complete review |
@@ -201,20 +211,72 @@ be present.
 | --- | --- | --- |
 | `copilot-token` | required | PAT used by Copilot CLI |
 | `github-token` | required | Caller `github.token` used for PR comments |
-| `model` | `gpt-5.6-sol` | Copilot CLI model identifier |
+| `model` | `gpt-5.6-sol` | Copilot CLI model identifier of the finder |
+| `verifier-model` | `gpt-5.6-sol` | Model that checks each finding; empty turns verification off |
+| `verifier-effort` | `low` | Verifier reasoning effort |
+| `max-verifications` | `10` | Maximum verifier calls, one per finding |
+| `max-nits` | `3` | Maximum Nit findings per review |
+| `inline-comments` | `true` | Post each confirmed finding as an inline review comment |
 | `copilot-cli-version` | `1.0.74` | Exact CLI package version |
 | `node-version` | `lts/*` | Node.js version |
-| `reasoning-effort` | `high` | Model reasoning effort |
-| `context` | `long_context` | Model context tier |
+| `reasoning-effort` | `high` | Finder reasoning effort |
+| `context` | `long_context` | Model context tier, for the finder and the verifier |
 | `batch-max-bytes` | `50000` | Target batch size |
 | `file-max-bytes` | `120000` | Per-file review cap |
-| `max-batches` | `8` | Maximum model calls |
+| `max-batches` | `8` | Maximum finder calls |
 | `owner-only` | `true` | Require the PR author to own the repository |
 | `context-file` | `.github/ai-review-context.md` | Maintainer review context injected into the prompt (base ref only; empty disables) |
 | `comment-marker` | `ai-code-review-sticky` | Sticky comment identifier |
 | `verify-landed` | `false` | Fail the job unless the sticky comment covers the current head from this run attempt; a missing `copilot-token` then fails the job too |
 | `allow-missing-token` | `false` | With `verify-landed` on, skip with a warning instead of failing when `copilot-token` is empty |
 | `review-scope` | `full` | `since-last-review` reviews each pull request in full once, then only the commits since this reviewer's last complete review |
+
+## Findings and verification
+
+The finder answers each batch with one JSON block, which the scripts parse
+rather than pass through, so the comment is rendered once from the parsed
+findings. (The Copilot CLI prints a reply twice, as Markdown and again as
+plain text, and before this every sticky showed both.) Each finding has a
+file, a line, a title, the issue, its impact, a fix, and one of three
+severities:
+
+| Severity | Meaning | Counted |
+| --- | --- | --- |
+| `Important` | A defect the pull request introduces that should be fixed before it merges | yes |
+| `Nit` | A real but minor problem that need not block the merge | yes |
+| `Pre-existing` | A real defect in code the pull request does not change | never |
+
+A severity outside the vocabulary maps onto it (`HIGH` is Important, `LOW` is
+Nit), and anything unrecognised counts as Important, so no finding is hidden
+by its label. At most `max-nits` Nit findings are reported per review; the
+comment says how many more were left out.
+
+Each finding then goes to the verifier (`verifier-model`, by default
+`gpt-5.6-sol` at `low` effort), in its own call, with evidence the scripts
+gather from the head commit: the file it names, numbered by line (the whole
+file, or the 48 KB around the cited line), what the pull request changes in
+that file, and where the identifiers the finding names appear in the
+repository, from `git grep`. It answers `CONFIRMED` or `REFUTED` with a
+one-line reason, and is told to refute a finding the evidence contradicts,
+such as code called unused that has a caller. At most `max-verifications`
+findings are verified per run, Important first.
+
+The sticky comment starts, under its header, with a summary line that opens
+with the count of findings to address: confirmed Important and Nit findings.
+Confirmed findings follow in full, then confirmed pre-existing issues under
+their own heading. Unconfirmed findings, refuted or not verified, are listed
+below the fold with the verifier's reason. With `inline-comments` on, the
+confirmed findings that sit on a line of the pull request's diff are also
+posted as one pull request review, with a comment on each line, after the
+sticky comment is written; if that post fails, the job warns and the sticky
+still lists them.
+
+The result marker (`<!-- ai-code-review-result: ... -->`) is `findings` when
+a confirmed Important or Nit finding counts, when a finding could not be
+verified, or when the review was incomplete, and `clean` otherwise, so a
+pre-existing issue or a refuted finding alone leaves it clean. With
+`verifier-model` empty, verification is off: every finding counts as before,
+listed unverified, and none is posted inline.
 
 ## When a review call fails
 
@@ -227,6 +289,12 @@ as `?`. A call that exits successfully with an empty reply counts as failed
 too, since it reviewed nothing. If every call failed, the job fails after
 posting the comment, so nothing reports success over a review that never
 happened; a partial failure is a warning.
+
+A reply that does not follow the findings format is treated the same way:
+its files count as not reviewed, and the reply itself is shown below the fold.
+A verification call that fails, or whose reply has no verdict, leaves its
+finding unverified and adds a second **Incomplete review** note; if every
+verification call failed, the job fails too.
 
 A model that the Copilot seat no longer offers fails every call within
 seconds with `Error: Model "<id>" from --model flag is not available.`,
@@ -343,7 +411,17 @@ review too, and later runs build on it.
   only — never from the PR head — so PRs cannot influence their own review
   prompt.
 - Copilot's tool allowlist contains only `report_intent`; file, shell, web, and
-  GitHub tools are unavailable.
+  GitHub tools are unavailable. The verifier runs with the same restrictions
+  (`copilot_call` in `scripts/lib.sh`). Its evidence is gathered by
+  `scripts/review-files.mjs` in a step without the Copilot token, from the
+  head commit's objects rather than the working tree, so a symbolic link in
+  the pull request is shown as its link text and never followed, and
+  `git grep` searches only the commit's tree for fixed strings.
+- Model text in the sticky comment cannot open an HTML comment, so a finding
+  cannot forge a marker, or close the section it is collapsed in.
+- Inline review comments use the same `github-token` and its
+  `pull-requests: write` permission; they are posted only after the head is
+  rechecked and the sticky comment is written.
 - Built-in MCP servers and remote session export are disabled.
 - `COPILOT_GITHUB_TOKEN` is marked as a secret environment variable so it is
   removed from tool environments and redacted from output. CLI error output

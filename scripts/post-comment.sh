@@ -61,6 +61,16 @@ if [ -s scope.since ]; then
   fi
 fi
 
+# The parts of the comment that come from the findings: the summary line,
+# which starts with the count of findings to address, the findings
+# themselves, the result, and the inline review of the confirmed ones.
+node "$GITHUB_ACTION_PATH/scripts/findings.mjs" render "$REVIEW_WORK_DIR"
+result=$(cat result)
+if ! [[ "$result" =~ ^(clean|findings)$ ]]; then
+  echo "::error::the review's result is malformed"
+  exit 1
+fi
+
 marker="<!-- $COMMENT_MARKER -->"
 {
   echo "$marker"
@@ -92,18 +102,13 @@ marker="<!-- $COMMENT_MARKER -->"
     fi
   fi
   # The result marker ends the header that sticky_header_fields reads; model
-  # output only ever follows it. An incremental review re-checks only the
-  # commits since the last review, so findings from before stand until a
-  # full review: after findings it stays findings, even with nothing new
-  # found. An empty incremental diff after a clean review stays clean.
-  if [ "$previous_result" = findings ]; then
-    echo "<!-- ai-code-review-result: findings -->"
-  elif is_empty_incremental_review "$REVIEW_WORK_DIR" \
-    || is_complete_clean_review "$REVIEW_WORK_DIR"; then
-    echo "<!-- ai-code-review-result: clean -->"
-  else
-    echo "<!-- ai-code-review-result: findings -->"
-  fi
+  # output only ever follows it. It is findings when a finding counts, when
+  # a finding could not be verified or the review was incomplete, and, for an
+  # incremental review, when the review it builds on had findings, which
+  # stand until a full review.
+  echo "<!-- ai-code-review-result: $result -->"
+  echo
+  cat summary.md
   echo
   if [ -s overflow.note ]; then
     echo "> **Partial coverage** - some content was not fully reviewed:"
@@ -117,8 +122,16 @@ marker="<!-- $COMMENT_MARKER -->"
     cat review.failures
     echo
   fi
-  cat review.md
-  echo
+  if [ -s verify.failures ]; then
+    echo "> **Incomplete review** - one or more verification calls failed; those findings were NOT verified and are listed below the fold:"
+    echo
+    cat verify.failures
+    echo
+  fi
+  if [ -s body.md ]; then
+    cat body.md
+    echo
+  fi
   echo "_Automated, independent-model review (updated each push). Not a substitute for human judgment._"
 } > comment.full.md
 
@@ -163,4 +176,16 @@ else
   gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
     -F body=@comment.md >/dev/null
   echo "created sticky review comment"
+fi
+
+# The confirmed findings on lines the pull request changes, as one review
+# with a comment on each line, after the sticky comment is written. It is a
+# convenience on top of the sticky, which lists every finding: a failure here
+# is a warning.
+if [ -s inline.json ]; then
+  if gh api -X POST "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" --input inline.json >/dev/null; then
+    echo "posted the confirmed findings as inline review comments"
+  else
+    echo "::warning::the confirmed findings could not be posted as inline review comments; the sticky comment lists them"
+  fi
 fi

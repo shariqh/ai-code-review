@@ -53,6 +53,35 @@ if ! [[ "${COMMENT_MARKER:-}" =~ ^[A-Za-z0-9_-]+$ ]]; then
   exit 1
 fi
 
+# An empty verifier model turns verification off.
+if [ -n "${VERIFIER_MODEL:-}" ] && ! [[ "$VERIFIER_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "::error::verifier-model must be empty or a Copilot CLI model identifier such as gpt-5.6-sol"
+  exit 1
+fi
+
+case "${VERIFIER_EFFORT:-low}" in
+  none|minimal|low|medium|high|xhigh|max) ;;
+  *)
+    echo "::error::verifier-effort must be one of none, minimal, low, medium, high, xhigh, max"
+    exit 1
+    ;;
+esac
+
+for setting in "max-verifications=${MAX_VERIFICATIONS:-10}" "max-nits=${MAX_NITS:-3}"; do
+  if ! [[ "${setting#*=}" =~ ^[0-9]+$ ]]; then
+    echo "::error::${setting%%=*} must be a non-negative integer"
+    exit 1
+  fi
+done
+
+case "${INLINE_COMMENTS:-true}" in
+  true|false) ;;
+  *)
+    echo "::error::inline-comments must be true or false"
+    exit 1
+    ;;
+esac
+
 case "${EVENT_NAME:-}" in
   pull_request|pull_request_target) ;;
   *) skip "AI code review only runs for pull request events." "not-pull-request" ;;
